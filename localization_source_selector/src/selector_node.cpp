@@ -49,10 +49,13 @@ using localization_adapter_interfaces::msg::LocalizationSourceCandidate;
 using localization_adapter_interfaces::msg::SelectedPoseCandidate;
 
 constexpr std::int64_t kNanosecondsPerSecond = 1000000000LL;
+constexpr std::chrono::seconds kStartupGraphGrace{5};
 constexpr char kCandidateMessageType[] =
   "localization_adapter_interfaces/msg/LocalizationSourceCandidate";
 constexpr char kSelectedMessageType[] =
   "localization_adapter_interfaces/msg/SelectedPoseCandidate";
+constexpr char kUnknownNodeName[] = "_NODE_NAME_UNKNOWN_";
+constexpr char kUnknownNodeNamespace[] = "_NODE_NAMESPACE_UNKNOWN_";
 
 rcl_interfaces::msg::ParameterDescriptor ReadOnlyDescriptor(const std::string & description)
 {
@@ -92,6 +95,12 @@ std::string FullyQualifiedNodeName(const rclcpp::TopicEndpointInfo & endpoint)
   }
   return node_namespace + (node_namespace.back() == '/' ? "" : "/") +
          endpoint.node_name();
+}
+
+bool EndpointIdentityIsUnknown(const rclcpp::TopicEndpointInfo & endpoint)
+{
+  return endpoint.node_name() == kUnknownNodeName ||
+         endpoint.node_namespace() == kUnknownNodeNamespace;
 }
 
 template<typename Gid>
@@ -220,6 +229,7 @@ LocalizationSourceSelector::LocalizationSourceSelector(const rclcpp::NodeOptions
     ReadOnlyDescriptor("Version-controlled selector contract YAML."));
   contract_ = LoadContractConfig(contract_file_);
   ValidateModeContract(contract_, mode_);
+  startup_graph_deadline_ = std::chrono::steady_clock::now() + kStartupGraphGrace;
   localization_epoch_id_ = GenerateEpochId();
   diagnostic_status_name_ =
     std::string(get_fully_qualified_name()) + ": localization source selector";
@@ -279,6 +289,12 @@ LocalizationSourceSelector::LocalizationSourceSelector(const rclcpp::NodeOptions
     "Loaded %s selector contract %s; automatic source switching and privileged outputs are "
     "disabled",
     mode_.c_str(), contract_.selector_contract_id.c_str());
+}
+
+LocalizationSourceSelector::TopicEndpointInfoList
+LocalizationSourceSelector::GetPublishersInfoByTopic(const std::string & topic)
+{
+  return get_publishers_info_by_topic(topic);
 }
 
 void LocalizationSourceSelector::OnCandidate(
@@ -424,7 +440,12 @@ void LocalizationSourceSelector::OnCandidate(
   last_source_pose_ = message->pose;
   ++accepted_;
 
+  bool output_authority_valid = false;
   if (state_ == State::kStarting) {
+    output_authority_valid = OutputAuthorityValidLocked();
+    if (!output_authority_valid) {
+      return;
+    }
     state_ = State::kHealthy;
     reason_code_ = "SOURCE_HEALTHY";
   } else if (state_ == State::kStale) {
@@ -442,7 +463,9 @@ void LocalizationSourceSelector::OnCandidate(
     recovery_progress_ = contract_.health.recovery_consecutive_samples;
   }
 
-  if (state_ == State::kHealthy && OutputAuthorityValidLocked()) {
+  if (state_ == State::kHealthy &&
+    (output_authority_valid || OutputAuthorityValidLocked()))
+  {
     PublishSelectedLocked(*message, aligned_pose);
   }
 }
@@ -458,12 +481,53 @@ bool LocalizationSourceSelector::ValidateMessagePublisherLocked(
   PublisherGid message_gid{};
   const auto & raw_gid = message_info.get_rmw_message_info().publisher_gid;
   std::copy_n(raw_gid.data, RMW_GID_STORAGE_SIZE, message_gid.begin());
-  const auto endpoints = get_publishers_info_by_topic(contract_.input.topic);
-  if (endpoints.size() != 1U ||
-    !GidsEqual(endpoints.front().endpoint_gid(), message_gid))
+  const auto endpoints = GetPublishersInfoByTopic(contract_.input.topic);
+  if (endpoints.empty() &&
+    StartupGraphGraceActiveLocked(bound_publisher_gid_.has_value()))
   {
+    MarkStartupGraphWaitLocked("WAITING_FOR_SOURCE_PUBLISHER_GRAPH");
+    return false;
+  }
+  if (endpoints.size() > 1U) {
+    ++input_authority_violation_;
+    LatchLocked("SOURCE_PUBLISHER_NOT_UNIQUE");
+    return false;
+  }
+  if (endpoints.empty()) {
     ++input_authority_violation_;
     LatchLocked("SOURCE_MESSAGE_GID_NOT_UNIQUE");
+    return false;
+  }
+  const auto & endpoint = endpoints.front();
+  const auto & qos = endpoint.qos_profile().get_rmw_qos_profile();
+  if (endpoint.topic_type() != kCandidateMessageType ||
+    !CandidatePublisherQosIsCompatible(qos, contract_.input.qos))
+  {
+    ++input_authority_violation_;
+    LatchLocked("SOURCE_PUBLISHER_AUTHORITY_MISMATCH");
+    return false;
+  }
+  if (EndpointIdentityIsUnknown(endpoint)) {
+    if (StartupGraphGraceActiveLocked(bound_publisher_gid_.has_value())) {
+      MarkStartupGraphWaitLocked("WAITING_FOR_SOURCE_PUBLISHER_GRAPH");
+    } else {
+      ++input_authority_violation_;
+      LatchLocked("SOURCE_PUBLISHER_AUTHORITY_MISMATCH");
+    }
+    return false;
+  }
+  if (FullyQualifiedNodeName(endpoint) != contract_.input.expected_publisher) {
+    ++input_authority_violation_;
+    LatchLocked("SOURCE_PUBLISHER_AUTHORITY_MISMATCH");
+    return false;
+  }
+  if (!GidsEqual(endpoint.endpoint_gid(), message_gid)) {
+    if (StartupGraphGraceActiveLocked(bound_publisher_gid_.has_value())) {
+      MarkStartupGraphWaitLocked("WAITING_FOR_SOURCE_PUBLISHER_GRAPH");
+    } else {
+      ++input_authority_violation_;
+      LatchLocked("SOURCE_MESSAGE_GID_NOT_UNIQUE");
+    }
     return false;
   }
   if (bound_publisher_gid_.has_value() &&
@@ -481,7 +545,7 @@ bool LocalizationSourceSelector::ValidateMessagePublisherLocked(
 
 void LocalizationSourceSelector::UpdateInputAuthorityLocked()
 {
-  const auto endpoints = get_publishers_info_by_topic(contract_.input.topic);
+  const auto endpoints = GetPublishersInfoByTopic(contract_.input.topic);
   input_publisher_count_ = endpoints.size();
   actual_input_publisher_ = "not_unique_or_missing";
   actual_input_type_ = "not_unique_or_missing";
@@ -496,6 +560,14 @@ void LocalizationSourceSelector::UpdateInputAuthorityLocked()
     return;
   }
   if (endpoints.empty()) {
+    if (StartupGraphGraceActiveLocked(bound_publisher_gid_.has_value())) {
+      MarkStartupGraphWaitLocked("WAITING_FOR_SOURCE_PUBLISHER_GRAPH");
+    } else {
+      ++input_authority_violation_;
+      LatchLocked(
+        bound_publisher_gid_.has_value() ?
+        "SOURCE_PUBLISHER_EPOCH_CHANGED" : "SOURCE_PUBLISHER_GRAPH_TIMEOUT");
+    }
     return;
   }
 
@@ -508,10 +580,23 @@ void LocalizationSourceSelector::UpdateInputAuthorityLocked()
   actual_qos_history_ = HistoryToString(qos.history);
   actual_qos_depth_ = qos.depth;
 
-  if (actual_input_publisher_ != contract_.input.expected_publisher ||
-    actual_input_type_ != kCandidateMessageType ||
+  if (actual_input_type_ != kCandidateMessageType ||
     !CandidatePublisherQosIsCompatible(qos, contract_.input.qos))
   {
+    ++input_authority_violation_;
+    LatchLocked("SOURCE_PUBLISHER_AUTHORITY_MISMATCH");
+    return;
+  }
+  if (EndpointIdentityIsUnknown(endpoint)) {
+    if (StartupGraphGraceActiveLocked(bound_publisher_gid_.has_value())) {
+      MarkStartupGraphWaitLocked("WAITING_FOR_SOURCE_PUBLISHER_GRAPH");
+    } else {
+      ++input_authority_violation_;
+      LatchLocked("SOURCE_PUBLISHER_AUTHORITY_MISMATCH");
+    }
+    return;
+  }
+  if (actual_input_publisher_ != contract_.input.expected_publisher) {
     ++input_authority_violation_;
     LatchLocked("SOURCE_PUBLISHER_AUTHORITY_MISMATCH");
     return;
@@ -526,13 +611,16 @@ void LocalizationSourceSelector::UpdateInputAuthorityLocked()
 
 bool LocalizationSourceSelector::OutputAuthorityValidLocked()
 {
-  const auto endpoints = get_publishers_info_by_topic(contract_.output.topic);
+  const auto endpoints = GetPublishersInfoByTopic(contract_.output.topic);
   output_publisher_count_ = endpoints.size();
   output_publisher_gid_valid_ = false;
-  // A local publisher can briefly be absent from the graph cache during startup.
-  // No sample is published in that window, but it is not an authority violation.
   if (endpoints.empty()) {
-    reason_code_ = "WAITING_FOR_SELECTED_OUTPUT_GRAPH";
+    if (StartupGraphGraceActiveLocked(output_authority_was_validated_)) {
+      MarkStartupGraphWaitLocked("WAITING_FOR_SELECTED_OUTPUT_GRAPH");
+    } else {
+      ++output_authority_violation_;
+      LatchLocked("SELECTED_OUTPUT_PUBLISHER_MISSING");
+    }
     return false;
   }
   if (endpoints.size() > 1U) {
@@ -542,26 +630,58 @@ bool LocalizationSourceSelector::OutputAuthorityValidLocked()
   }
   const auto & endpoint = endpoints.front();
   const auto & qos = endpoint.qos_profile().get_rmw_qos_profile();
-  if (FullyQualifiedNodeName(endpoint) != contract_.output.expected_publisher ||
-    endpoint.topic_type() != kSelectedMessageType ||
+  if (endpoint.topic_type() != kSelectedMessageType ||
     !CandidatePublisherQosIsCompatible(qos, contract_.output.qos))
   {
     ++output_authority_violation_;
     LatchLocked("SELECTED_OUTPUT_AUTHORITY_MISMATCH");
     return false;
   }
-  if (!GidsEqual(endpoint.endpoint_gid(), selected_publisher_gid_)) {
+  if (EndpointIdentityIsUnknown(endpoint)) {
+    if (StartupGraphGraceActiveLocked(output_authority_was_validated_)) {
+      MarkStartupGraphWaitLocked("WAITING_FOR_SELECTED_OUTPUT_GRAPH");
+    } else {
+      ++output_authority_violation_;
+      LatchLocked("SELECTED_OUTPUT_AUTHORITY_MISMATCH");
+    }
+    return false;
+  }
+  if (FullyQualifiedNodeName(endpoint) != contract_.output.expected_publisher) {
     ++output_authority_violation_;
-    LatchLocked("SELECTED_OUTPUT_PUBLISHER_GID_MISMATCH");
+    LatchLocked("SELECTED_OUTPUT_AUTHORITY_MISMATCH");
+    return false;
+  }
+  if (!GidsEqual(endpoint.endpoint_gid(), selected_publisher_gid_)) {
+    if (StartupGraphGraceActiveLocked(output_authority_was_validated_)) {
+      MarkStartupGraphWaitLocked("WAITING_FOR_SELECTED_OUTPUT_GRAPH");
+    } else {
+      ++output_authority_violation_;
+      LatchLocked("SELECTED_OUTPUT_PUBLISHER_GID_MISMATCH");
+    }
     return false;
   }
   output_publisher_gid_valid_ = true;
-  if (state_ == State::kHealthy &&
-    reason_code_ == "WAITING_FOR_SELECTED_OUTPUT_GRAPH")
-  {
-    reason_code_ = "SOURCE_HEALTHY";
+  if (reason_code_ == "WAITING_FOR_SELECTED_OUTPUT_GRAPH") {
+    reason_code_ = state_ == State::kHealthy ? "SOURCE_HEALTHY" : "WAITING_FOR_SOURCE";
   }
   return true;
+}
+
+bool LocalizationSourceSelector::StartupGraphGraceActiveLocked(
+  const bool authority_was_validated) const
+{
+  return !authority_was_validated &&
+         std::chrono::steady_clock::now() <= startup_graph_deadline_;
+}
+
+void LocalizationSourceSelector::MarkStartupGraphWaitLocked(const std::string & reason)
+{
+  if (reason == "WAITING_FOR_SELECTED_OUTPUT_GRAPH" &&
+    !bound_publisher_gid_.has_value())
+  {
+    return;
+  }
+  reason_code_ = reason;
 }
 
 void LocalizationSourceSelector::MarkRecoveringLocked(const std::string & reason)
@@ -597,6 +717,7 @@ void LocalizationSourceSelector::PublishSelectedLocked(
   output.authorization = contract_.output.authorization;
   selected_publisher_->publish(output);
   ++published_;
+  output_authority_was_validated_ = true;
 }
 
 void LocalizationSourceSelector::OnDiagnosticTimer()
@@ -607,7 +728,9 @@ void LocalizationSourceSelector::OnDiagnosticTimer()
   if (state_ != State::kLatchedFault) {
     (void)OutputAuthorityValidLocked();
   }
-  if (state_ != State::kLatchedFault && last_valid_receive_time_.has_value()) {
+  if (state_ != State::kLatchedFault && state_ != State::kStarting &&
+    last_valid_receive_time_.has_value())
+  {
     const double age_sec =
       std::chrono::duration<double>(now - last_valid_receive_time_.value()).count();
     if (age_sec > contract_.health.stale_after_sec &&

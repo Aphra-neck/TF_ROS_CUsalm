@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -63,6 +64,68 @@ protected:
   {
     rclcpp::shutdown();
   }
+};
+
+enum class EndpointIdentity
+{
+  kReported,
+  kUnknown,
+  kMismatchedGid,
+  kIncorrect,
+};
+
+class ScriptedGateway : public LocalizationOutputGateway
+{
+public:
+  explicit ScriptedGateway(
+    const rclcpp::NodeOptions & options,
+    const EndpointIdentity selected_endpoint_identity)
+  : LocalizationOutputGateway(options),
+    selected_endpoint_identity_(selected_endpoint_identity)
+  {
+  }
+
+  void SetSelectedEndpointIdentity(const EndpointIdentity identity)
+  {
+    selected_endpoint_identity_ = identity;
+  }
+
+  void SetOutputEndpointIdentity(const EndpointIdentity identity)
+  {
+    output_endpoint_identity_ = identity;
+  }
+
+protected:
+  TopicEndpointInfoList GetPublishersInfoByTopic(const std::string & topic) override
+  {
+    auto endpoints = LocalizationOutputGateway::GetPublishersInfoByTopic(topic);
+    const EndpointIdentity * identity = nullptr;
+    if (topic == "/localization/selected/pose") {
+      identity = &selected_endpoint_identity_;
+    } else if (topic == "/mavros/vision_pose/pose_cov") {
+      identity = &output_endpoint_identity_;
+    } else {
+      return endpoints;
+    }
+    for (auto & endpoint : endpoints) {
+      if (*identity == EndpointIdentity::kUnknown) {
+        endpoint.node_name("_NODE_NAME_UNKNOWN_");
+        endpoint.node_namespace("_NODE_NAMESPACE_UNKNOWN_");
+      } else if (*identity == EndpointIdentity::kMismatchedGid) {
+        auto gid = endpoint.endpoint_gid();
+        gid.front() = static_cast<std::uint8_t>(gid.front() ^ 0xffU);
+        endpoint.endpoint_gid(gid);
+      } else if (*identity == EndpointIdentity::kIncorrect) {
+        endpoint.node_name("incorrect_localization_source_selector");
+        endpoint.node_namespace("/");
+      }
+    }
+    return endpoints;
+  }
+
+private:
+  EndpointIdentity selected_endpoint_identity_;
+  EndpointIdentity output_endpoint_identity_{EndpointIdentity::kReported};
 };
 
 rclcpp::NodeOptions Options()
@@ -148,9 +211,10 @@ bool DiagnosticHasValue(
     });
 }
 
-TEST_F(ActivePoseOutput, GatesStartupThenCopiesPoseDuringManualArming)
+TEST_F(ActivePoseOutput, RecoversFromUnknownSelectedIdentityThenCopiesPose)
 {
-  auto gateway = std::make_shared<LocalizationOutputGateway>(Options());
+  auto gateway = std::make_shared<ScriptedGateway>(
+    Options(), EndpointIdentity::kUnknown);
   auto selector = std::make_shared<rclcpp::Node>(
     "localization_source_selector", "/");
   auto mavros_sys = std::make_shared<rclcpp::Node>("sys", "/mavros");
@@ -201,6 +265,18 @@ TEST_F(ActivePoseOutput, GatesStartupThenCopiesPoseDuringManualArming)
         timesync_publisher->get_subscription_count() == 1U;
       }));
 
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&diagnostics]() {
+        return DiagnosticHasValue(
+          diagnostics, "reason_code",
+          "WAITING_FOR_SELECTED_PUBLISHER_GRAPH_STABILITY");
+      }));
+  EXPECT_EQ(output_subscription->get_publisher_count(), 0U);
+  gateway->SetSelectedEndpointIdentity(EndpointIdentity::kReported);
+  diagnostics.clear();
+
   State state;
   state.connected = true;
   state.armed = false;
@@ -247,6 +323,22 @@ TEST_F(ActivePoseOutput, GatesStartupThenCopiesPoseDuringManualArming)
       executor,
       [&]() {return output_subscription->get_publisher_count() == 1U;},
       publish_readiness));
+
+  gateway->SetSelectedEndpointIdentity(EndpointIdentity::kMismatchedGid);
+  diagnostics.clear();
+  selected_publisher->publish(Candidate(*selector));
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&diagnostics]() {
+        return DiagnosticHasValue(
+          diagnostics, "reason_code",
+          "WAITING_FOR_SELECTED_PUBLISHER_GRAPH_STABILITY") &&
+        DiagnosticHasValue(diagnostics, "state", "active_starting");
+      }));
+  EXPECT_TRUE(outputs.empty());
+  gateway->SetSelectedEndpointIdentity(EndpointIdentity::kReported);
+  diagnostics.clear();
 
   const auto first_input = Candidate(*selector);
   selected_publisher->publish(first_input);
@@ -333,6 +425,223 @@ TEST_F(ActivePoseOutput, GatesStartupThenCopiesPoseDuringManualArming)
   EXPECT_FALSE(
     SpinUntil(
       executor, [&outputs]() {return outputs.size() > 3U;}, {}, 250ms));
+
+  (void)diagnostic_subscription;
+}
+
+TEST_F(ActivePoseOutput, IncorrectSelectedIdentityStillLatches)
+{
+  auto gateway = std::make_shared<ScriptedGateway>(
+    Options(), EndpointIdentity::kIncorrect);
+  auto selector = std::make_shared<rclcpp::Node>(
+    "localization_source_selector", "/");
+  auto observer = std::make_shared<rclcpp::Node>(
+    std::string(TEST_PROFILE) + "_incorrect_identity_observer");
+  const auto reliable_qos = rclcpp::QoS(rclcpp::KeepLast(10))
+    .reliable().durability_volatile();
+  auto selected_publisher = selector->create_publisher<SelectedPoseCandidate>(
+    "/localization/selected/pose", reliable_qos);
+  std::vector<DiagnosticArray> diagnostics;
+  auto diagnostic_subscription = observer->create_subscription<DiagnosticArray>(
+    "/diagnostics", reliable_qos,
+    [&diagnostics](const DiagnosticArray::ConstSharedPtr message) {
+      diagnostics.push_back(*message);
+    });
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(gateway);
+  executor.add_node(selector);
+  executor.add_node(observer);
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&]() {return selected_publisher->get_subscription_count() == 1U;}));
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&diagnostics]() {
+        return DiagnosticHasValue(
+          diagnostics, "reason_code", "SELECTED_PUBLISHER_AUTHORITY_MISMATCH") &&
+        DiagnosticHasValue(diagnostics, "state", "latched_fault");
+      }));
+
+  diagnostics.clear();
+  gateway->SetSelectedEndpointIdentity(EndpointIdentity::kReported);
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&diagnostics]() {
+        return DiagnosticHasValue(diagnostics, "state", "latched_fault");
+      }));
+
+  (void)diagnostic_subscription;
+}
+
+TEST_F(ActivePoseOutput, SelectedGraphMismatchAfterMessageBindingLatches)
+{
+  auto gateway = std::make_shared<ScriptedGateway>(
+    Options(), EndpointIdentity::kReported);
+  auto selector = std::make_shared<rclcpp::Node>(
+    "localization_source_selector", "/");
+  auto observer = std::make_shared<rclcpp::Node>(
+    std::string(TEST_PROFILE) + "_bound_identity_observer");
+  const auto reliable_qos = rclcpp::QoS(rclcpp::KeepLast(10))
+    .reliable().durability_volatile();
+  auto selected_publisher = selector->create_publisher<SelectedPoseCandidate>(
+    "/localization/selected/pose", reliable_qos);
+  std::vector<DiagnosticArray> diagnostics;
+  auto diagnostic_subscription = observer->create_subscription<DiagnosticArray>(
+    "/diagnostics", reliable_qos,
+    [&diagnostics](const DiagnosticArray::ConstSharedPtr message) {
+      diagnostics.push_back(*message);
+    });
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(gateway);
+  executor.add_node(selector);
+  executor.add_node(observer);
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&]() {return selected_publisher->get_subscription_count() == 1U;}));
+
+  selected_publisher->publish(Candidate(*selector));
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&diagnostics]() {
+        return DiagnosticHasValue(
+          diagnostics, "localization_epoch_id", "test-localization-epoch");
+      }));
+
+  diagnostics.clear();
+  gateway->SetSelectedEndpointIdentity(EndpointIdentity::kMismatchedGid);
+  selected_publisher->publish(Candidate(*selector));
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&diagnostics]() {
+        return DiagnosticHasValue(diagnostics, "state", "latched_fault") &&
+        (DiagnosticHasValue(
+          diagnostics, "reason_code",
+          "SELECTED_PUBLISHER_AUTHORITY_MISMATCH") ||
+        DiagnosticHasValue(
+          diagnostics, "reason_code", "SELECTED_PUBLISHER_GID_CHANGED"));
+      }));
+
+  diagnostics.clear();
+  gateway->SetSelectedEndpointIdentity(EndpointIdentity::kReported);
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&diagnostics]() {
+        return DiagnosticHasValue(diagnostics, "state", "latched_fault");
+      }));
+
+  (void)diagnostic_subscription;
+}
+
+TEST_F(ActivePoseOutput, OutputGraphMismatchAfterInitialValidationLatches)
+{
+  auto gateway = std::make_shared<ScriptedGateway>(
+    Options(), EndpointIdentity::kReported);
+  auto selector = std::make_shared<rclcpp::Node>(
+    "localization_source_selector", "/");
+  auto mavros_sys = std::make_shared<rclcpp::Node>("sys", "/mavros");
+  auto mavros_time = std::make_shared<rclcpp::Node>("time", "/mavros");
+  auto mavros_vision = std::make_shared<rclcpp::Node>(
+    "vision_pose", "/mavros");
+
+  const auto reliable_qos = rclcpp::QoS(rclcpp::KeepLast(10))
+    .reliable().durability_volatile();
+  const auto state_qos = rclcpp::QoS(rclcpp::KeepLast(10))
+    .reliable().transient_local();
+  const auto timesync_qos = rclcpp::QoS(rclcpp::KeepLast(10))
+    .best_effort().durability_volatile();
+  auto selected_publisher = selector->create_publisher<SelectedPoseCandidate>(
+    "/localization/selected/pose", reliable_qos);
+  auto state_publisher = mavros_sys->create_publisher<State>(
+    "/mavros/state", state_qos);
+  auto timesync_publisher = mavros_time->create_publisher<TimesyncStatus>(
+    "/mavros/timesync_status", timesync_qos);
+  auto output_subscription =
+    mavros_vision->create_subscription<PoseWithCovarianceStamped>(
+    "/mavros/vision_pose/pose_cov", reliable_qos,
+    [](const PoseWithCovarianceStamped::ConstSharedPtr) {});
+  std::vector<DiagnosticArray> diagnostics;
+  auto diagnostic_subscription = mavros_vision->create_subscription<DiagnosticArray>(
+    "/diagnostics", reliable_qos,
+    [&diagnostics](const DiagnosticArray::ConstSharedPtr message) {
+      diagnostics.push_back(*message);
+    });
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(gateway);
+  executor.add_node(selector);
+  executor.add_node(mavros_sys);
+  executor.add_node(mavros_time);
+  executor.add_node(mavros_vision);
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&]() {
+        return selected_publisher->get_subscription_count() == 1U &&
+        state_publisher->get_subscription_count() == 1U &&
+        timesync_publisher->get_subscription_count() == 1U;
+      }));
+
+  State state;
+  state.connected = true;
+  state.armed = false;
+  state.manual_input = true;
+  state.mode = "STABILIZED";
+  state.system_status = 3U;
+  TimesyncStatus timesync;
+  timesync.remote_timestamp_ns = 1000000000ULL;
+  timesync.observed_offset_ns = 1000LL;
+  timesync.estimated_offset_ns = 1000LL;
+  timesync.round_trip_time_ms = 1.0F;
+  const auto publish_readiness = [&]() {
+      state.header.stamp = mavros_sys->get_clock()->now();
+      timesync.header.stamp = mavros_time->get_clock()->now();
+      state_publisher->publish(state);
+      timesync_publisher->publish(timesync);
+    };
+
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&]() {
+        return output_subscription->get_publisher_count() == 1U &&
+        DiagnosticHasValue(diagnostics, "output_publisher_gid_valid", "1");
+      },
+      publish_readiness));
+
+  diagnostics.clear();
+  gateway->SetOutputEndpointIdentity(EndpointIdentity::kMismatchedGid);
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&diagnostics]() {
+        return DiagnosticHasValue(diagnostics, "state", "latched_fault") &&
+        DiagnosticHasValue(
+          diagnostics, "reason_code",
+          "EXTERNAL_VISION_PUBLISHER_AUTHORITY_MISMATCH");
+      }));
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&]() {return output_subscription->get_publisher_count() == 0U;}));
+
+  diagnostics.clear();
+  gateway->SetOutputEndpointIdentity(EndpointIdentity::kReported);
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&diagnostics]() {
+        return DiagnosticHasValue(diagnostics, "state", "latched_fault");
+      }));
+  EXPECT_EQ(output_subscription->get_publisher_count(), 0U);
 
   (void)diagnostic_subscription;
 }

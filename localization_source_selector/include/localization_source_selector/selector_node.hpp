@@ -25,6 +25,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <localization_adapter_interfaces/msg/localization_source_candidate.hpp>
@@ -41,11 +42,17 @@ bool CandidatePublisherQosIsCompatible(
   const rmw_qos_profile_t & qos,
   const QosContractConfig & expected) noexcept;
 
-class LocalizationSourceSelector final : public rclcpp::Node
+class LocalizationSourceSelector : public rclcpp::Node
 {
 public:
   explicit LocalizationSourceSelector(
     const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
+  ~LocalizationSourceSelector() override = default;
+
+protected:
+  using TopicEndpointInfoList = std::vector<rclcpp::TopicEndpointInfo>;
+
+  virtual TopicEndpointInfoList GetPublishersInfoByTopic(const std::string & topic);
 
 private:
   using SteadyTime = std::chrono::steady_clock::time_point;
@@ -68,6 +75,8 @@ private:
   bool ValidateMessagePublisherLocked(const rclcpp::MessageInfo & message_info);
   void UpdateInputAuthorityLocked();
   bool OutputAuthorityValidLocked();
+  bool StartupGraphGraceActiveLocked(bool authority_was_validated) const;
+  void MarkStartupGraphWaitLocked(const std::string & reason);
   void MarkRecoveringLocked(const std::string & reason);
   void LatchLocked(const std::string & reason);
   void PublishSelectedLocked(
@@ -83,6 +92,7 @@ private:
   std::string diagnostic_status_name_;
   State state_{State::kStarting};
   std::string reason_code_{"WAITING_FOR_SOURCE"};
+  SteadyTime startup_graph_deadline_{};
   std::optional<SteadyTime> last_valid_receive_time_;
   std::optional<std::int64_t> last_accepted_stamp_ns_;
   std::optional<PublisherGid> bound_publisher_gid_;
@@ -100,6 +110,7 @@ private:
   std::size_t output_publisher_count_{0U};
   PublisherGid selected_publisher_gid_{};
   bool output_publisher_gid_valid_{false};
+  bool output_authority_was_validated_{false};
   std::string last_actual_parent_frame_;
   std::string last_actual_child_frame_;
   std::string last_actual_source_id_;

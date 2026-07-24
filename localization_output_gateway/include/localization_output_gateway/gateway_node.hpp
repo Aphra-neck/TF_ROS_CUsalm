@@ -24,6 +24,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
@@ -38,11 +39,18 @@
 namespace localization_output_gateway
 {
 
-class LocalizationOutputGateway final : public rclcpp::Node
+class LocalizationOutputGateway : public rclcpp::Node
 {
 public:
   explicit LocalizationOutputGateway(
     const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
+  ~LocalizationOutputGateway() override = default;
+
+protected:
+  using TopicEndpointInfoList = std::vector<rclcpp::TopicEndpointInfo>;
+
+  virtual TopicEndpointInfoList GetPublishersInfoByTopic(const std::string & topic);
+  virtual TopicEndpointInfoList GetSubscriptionsInfoByTopic(const std::string & topic);
 
 private:
   using PublisherGid = std::array<std::uint8_t, RMW_GID_STORAGE_SIZE>;

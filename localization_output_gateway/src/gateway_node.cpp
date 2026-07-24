@@ -51,6 +51,8 @@ constexpr char kSelectedPoseType[] =
   "localization_adapter_interfaces/msg/SelectedPoseCandidate";
 constexpr char kExternalVisionType[] =
   "geometry_msgs/msg/PoseWithCovarianceStamped";
+constexpr char kUnknownNodeName[] = "_NODE_NAME_UNKNOWN_";
+constexpr char kUnknownNodeNamespace[] = "_NODE_NAMESPACE_UNKNOWN_";
 constexpr char kMavrosStateType[] = "mavros_msgs/msg/State";
 constexpr char kTimesyncStatusType[] = "mavros_msgs/msg/TimesyncStatus";
 
@@ -76,6 +78,12 @@ std::string FullyQualifiedNodeName(const rclcpp::TopicEndpointInfo & endpoint)
   }
   return node_namespace + (node_namespace.back() == '/' ? "" : "/") +
          endpoint.node_name();
+}
+
+bool EndpointIdentityIsUnknown(const rclcpp::TopicEndpointInfo & endpoint) noexcept
+{
+  return endpoint.node_name() == kUnknownNodeName ||
+         endpoint.node_namespace() == kUnknownNodeNamespace;
 }
 
 template<typename Gid>
@@ -259,6 +267,18 @@ LocalizationOutputGateway::LocalizationOutputGateway(const rclcpp::NodeOptions &
     contract_.profile.c_str(), contract_.gateway_contract_id.c_str());
 }
 
+LocalizationOutputGateway::TopicEndpointInfoList
+LocalizationOutputGateway::GetPublishersInfoByTopic(const std::string & topic)
+{
+  return get_publishers_info_by_topic(topic);
+}
+
+LocalizationOutputGateway::TopicEndpointInfoList
+LocalizationOutputGateway::GetSubscriptionsInfoByTopic(const std::string & topic)
+{
+  return get_subscriptions_info_by_topic(topic);
+}
+
 void LocalizationOutputGateway::OnSelectedPose(
   const SelectedPoseCandidate::ConstSharedPtr message,
   const rclcpp::MessageInfo & message_info)
@@ -387,7 +407,7 @@ bool LocalizationOutputGateway::MessagePublisherIsValidLocked(
   PublisherGid message_gid{};
   const auto & raw_gid = message_info.get_rmw_message_info().publisher_gid;
   std::copy_n(raw_gid.data, RMW_GID_STORAGE_SIZE, message_gid.begin());
-  const auto endpoints = get_publishers_info_by_topic(topic);
+  const auto endpoints = GetPublishersInfoByTopic(topic);
   *publisher_count = endpoints.size();
   if (endpoints.empty()) {
     reason_code_ = "WAITING_FOR_" + reason_prefix + "_GRAPH";
@@ -402,13 +422,34 @@ bool LocalizationOutputGateway::MessagePublisherIsValidLocked(
   const auto & qos = endpoint.qos_profile().get_rmw_qos_profile();
   const bool qos_valid = type == kMavrosStateType ?
     MavrosStateQosIsCompatible(qos) : TimesyncQosIsCompatible(qos);
-  if (FullyQualifiedNodeName(endpoint) != expected_publisher ||
-    endpoint.topic_type() != type ||
-    !qos_valid ||
-    !GidsEqual(endpoint.endpoint_gid(), message_gid))
-  {
+  if (endpoint.topic_type() != type || !qos_valid) {
     ++authority_violations_;
     LatchLocked(reason_prefix + "_AUTHORITY_MISMATCH");
+    return false;
+  }
+  const bool startup_unbound =
+    state_ == State::kActiveStarting && !bound_gid->has_value();
+  if (EndpointIdentityIsUnknown(endpoint)) {
+    if (startup_unbound) {
+      reason_code_ = "WAITING_FOR_" + reason_prefix + "_GRAPH_STABILITY";
+    } else {
+      ++authority_violations_;
+      LatchLocked(reason_prefix + "_AUTHORITY_MISMATCH");
+    }
+    return false;
+  }
+  if (FullyQualifiedNodeName(endpoint) != expected_publisher) {
+    ++authority_violations_;
+    LatchLocked(reason_prefix + "_AUTHORITY_MISMATCH");
+    return false;
+  }
+  if (!GidsEqual(endpoint.endpoint_gid(), message_gid)) {
+    if (startup_unbound) {
+      reason_code_ = "WAITING_FOR_" + reason_prefix + "_GRAPH_STABILITY";
+    } else {
+      ++authority_violations_;
+      LatchLocked(reason_prefix + "_AUTHORITY_MISMATCH");
+    }
     return false;
   }
   if (bound_gid->has_value() &&
@@ -428,7 +469,7 @@ bool LocalizationOutputGateway::InputAuthorityIsValidLocked(
   PublisherGid message_gid{};
   const auto & raw_gid = message_info.get_rmw_message_info().publisher_gid;
   std::copy_n(raw_gid.data, RMW_GID_STORAGE_SIZE, message_gid.begin());
-  const auto endpoints = get_publishers_info_by_topic(contract_.input.topic);
+  const auto endpoints = GetPublishersInfoByTopic(contract_.input.topic);
   input_publisher_count_ = endpoints.size();
   if (endpoints.empty()) {
     reason_code_ = "WAITING_FOR_SELECTED_PUBLISHER_GRAPH";
@@ -441,13 +482,36 @@ bool LocalizationOutputGateway::InputAuthorityIsValidLocked(
   }
   const auto & endpoint = endpoints.front();
   const auto & qos = endpoint.qos_profile().get_rmw_qos_profile();
-  if (FullyQualifiedNodeName(endpoint) != contract_.input.expected_publisher ||
-    endpoint.topic_type() != kSelectedPoseType ||
-    !QosIsCompatible(qos, contract_.input.qos) ||
-    !GidsEqual(endpoint.endpoint_gid(), message_gid))
+  if (endpoint.topic_type() != kSelectedPoseType ||
+    !QosIsCompatible(qos, contract_.input.qos))
   {
     ++authority_violations_;
     LatchLocked("SELECTED_PUBLISHER_AUTHORITY_MISMATCH");
+    return false;
+  }
+  const bool startup_unbound =
+    state_ == State::kActiveStarting && !bound_input_gid_.has_value();
+  if (EndpointIdentityIsUnknown(endpoint)) {
+    if (startup_unbound) {
+      reason_code_ = "WAITING_FOR_SELECTED_PUBLISHER_GRAPH_STABILITY";
+    } else {
+      ++authority_violations_;
+      LatchLocked("SELECTED_PUBLISHER_AUTHORITY_MISMATCH");
+    }
+    return false;
+  }
+  if (FullyQualifiedNodeName(endpoint) != contract_.input.expected_publisher) {
+    ++authority_violations_;
+    LatchLocked("SELECTED_PUBLISHER_AUTHORITY_MISMATCH");
+    return false;
+  }
+  if (!GidsEqual(endpoint.endpoint_gid(), message_gid)) {
+    if (startup_unbound) {
+      reason_code_ = "WAITING_FOR_SELECTED_PUBLISHER_GRAPH_STABILITY";
+    } else {
+      ++authority_violations_;
+      LatchLocked("SELECTED_PUBLISHER_AUTHORITY_MISMATCH");
+    }
     return false;
   }
   if (bound_input_gid_.has_value() &&
@@ -463,15 +527,20 @@ bool LocalizationOutputGateway::InputAuthorityIsValidLocked(
 
 bool LocalizationOutputGateway::MavrosOutputSubscriberIsValidLocked()
 {
-  const auto endpoints = get_subscriptions_info_by_topic(
+  const auto endpoints = GetSubscriptionsInfoByTopic(
     contract_.external_vision_output.topic);
   output_subscription_count_ = endpoints.size();
   std::size_t matching_subscribers = 0U;
   bool expected_fqn_seen = false;
+  bool unknown_identity_seen = false;
   const bool output_subscriber_was_bound =
     bound_output_subscriber_gid_.has_value() || external_vision_publisher_;
   PublisherGid matching_gid{};
   for (const auto & endpoint : endpoints) {
+    if (EndpointIdentityIsUnknown(endpoint)) {
+      unknown_identity_seen = true;
+      continue;
+    }
     if (FullyQualifiedNodeName(endpoint) !=
       contract_.mavros.expected_external_vision_subscriber)
     {
@@ -495,6 +564,9 @@ bool LocalizationOutputGateway::MavrosOutputSubscriberIsValidLocked()
     } else if (output_subscriber_was_bound) {
       ++authority_violations_;
       LatchLocked("MAVROS_EXTERNAL_VISION_SUBSCRIBER_DISAPPEARED");
+    } else if (unknown_identity_seen && state_ == State::kActiveStarting) {
+      reason_code_ =
+        "WAITING_FOR_MAVROS_EXTERNAL_VISION_SUBSCRIBER_GRAPH_STABILITY";
     } else {
       reason_code_ = "WAITING_FOR_MAVROS_EXTERNAL_VISION_SUBSCRIBER";
     }
@@ -521,12 +593,13 @@ bool LocalizationOutputGateway::OutputAuthorityIsValidLocked()
   if (!external_vision_publisher_) {
     return false;
   }
-  const auto endpoints = get_publishers_info_by_topic(
+  const auto endpoints = GetPublishersInfoByTopic(
     contract_.external_vision_output.topic);
   output_publisher_count_ = endpoints.size();
+  const bool output_graph_was_bound = output_publisher_gid_valid_;
   output_publisher_gid_valid_ = false;
   if (endpoints.empty()) {
-    if (state_ == State::kActiveHealthy) {
+    if (state_ == State::kActiveHealthy || output_graph_was_bound) {
       ++authority_violations_;
       LatchLocked("EXTERNAL_VISION_PUBLISHER_DISAPPEARED");
     } else {
@@ -541,13 +614,34 @@ bool LocalizationOutputGateway::OutputAuthorityIsValidLocked()
   }
   const auto & endpoint = endpoints.front();
   const auto & qos = endpoint.qos_profile().get_rmw_qos_profile();
-  if (FullyQualifiedNodeName(endpoint) != contract_.expected_node_fqn ||
-    endpoint.topic_type() != kExternalVisionType ||
-    !QosIsCompatible(qos, contract_.external_vision_output.qos) ||
-    !GidMatchesRmw(endpoint.endpoint_gid(), external_vision_publisher_->get_gid()))
+  if (endpoint.topic_type() != kExternalVisionType ||
+    !QosIsCompatible(qos, contract_.external_vision_output.qos))
   {
     ++authority_violations_;
     LatchLocked("EXTERNAL_VISION_PUBLISHER_AUTHORITY_MISMATCH");
+    return false;
+  }
+  if (EndpointIdentityIsUnknown(endpoint)) {
+    if (state_ == State::kActiveStarting && !output_graph_was_bound) {
+      reason_code_ = "WAITING_FOR_EXTERNAL_VISION_PUBLISHER_GRAPH_STABILITY";
+    } else {
+      ++authority_violations_;
+      LatchLocked("EXTERNAL_VISION_PUBLISHER_AUTHORITY_MISMATCH");
+    }
+    return false;
+  }
+  if (FullyQualifiedNodeName(endpoint) != contract_.expected_node_fqn) {
+    ++authority_violations_;
+    LatchLocked("EXTERNAL_VISION_PUBLISHER_AUTHORITY_MISMATCH");
+    return false;
+  }
+  if (!GidMatchesRmw(endpoint.endpoint_gid(), external_vision_publisher_->get_gid())) {
+    if (state_ == State::kActiveStarting && !output_graph_was_bound) {
+      reason_code_ = "WAITING_FOR_EXTERNAL_VISION_PUBLISHER_GRAPH_STABILITY";
+    } else {
+      ++authority_violations_;
+      LatchLocked("EXTERNAL_VISION_PUBLISHER_AUTHORITY_MISMATCH");
+    }
     return false;
   }
   output_publisher_gid_valid_ = true;
@@ -556,10 +650,16 @@ bool LocalizationOutputGateway::OutputAuthorityIsValidLocked()
 
 void LocalizationOutputGateway::CreateExternalVisionPublisherLocked()
 {
-  const auto existing = get_publishers_info_by_topic(
+  const auto existing = GetPublishersInfoByTopic(
     contract_.external_vision_output.topic);
   output_publisher_count_ = existing.size();
   if (!existing.empty()) {
+    if (existing.size() == 1U && EndpointIdentityIsUnknown(existing.front()) &&
+      state_ == State::kActiveStarting)
+    {
+      reason_code_ = "WAITING_FOR_EXTERNAL_VISION_PUBLISHER_GRAPH_STABILITY";
+      return;
+    }
     ++authority_violations_;
     LatchLocked("EXTERNAL_VISION_PUBLISHER_ALREADY_EXISTS");
     return;
@@ -642,18 +742,25 @@ void LocalizationOutputGateway::LatchLocked(const std::string & reason)
 
 void LocalizationOutputGateway::UpdateGraphLocked()
 {
-  const auto input_endpoints = get_publishers_info_by_topic(contract_.input.topic);
+  const auto input_endpoints = GetPublishersInfoByTopic(contract_.input.topic);
   input_publisher_count_ = input_endpoints.size();
   if (!contract_.IsActive() || state_ == State::kLatchedFault) {
-    output_publisher_count_ = get_publishers_info_by_topic(
+    output_publisher_count_ = GetPublishersInfoByTopic(
       contract_.external_vision_output.topic).size();
     return;
   }
   if (!external_vision_publisher_) {
-    const auto existing_output_publishers = get_publishers_info_by_topic(
+    const auto existing_output_publishers = GetPublishersInfoByTopic(
       contract_.external_vision_output.topic);
     output_publisher_count_ = existing_output_publishers.size();
     if (!existing_output_publishers.empty()) {
+      if (existing_output_publishers.size() == 1U &&
+        EndpointIdentityIsUnknown(existing_output_publishers.front()) &&
+        state_ == State::kActiveStarting)
+      {
+        reason_code_ = "WAITING_FOR_EXTERNAL_VISION_PUBLISHER_GRAPH_STABILITY";
+        return;
+      }
       ++authority_violations_;
       LatchLocked("EXTERNAL_VISION_PUBLISHER_ALREADY_EXISTS");
       return;
@@ -676,10 +783,23 @@ void LocalizationOutputGateway::UpdateGraphLocked()
   }
   const auto & input_endpoint = input_endpoints.front();
   const auto & input_qos = input_endpoint.qos_profile().get_rmw_qos_profile();
-  if (FullyQualifiedNodeName(input_endpoint) != contract_.input.expected_publisher ||
-    input_endpoint.topic_type() != kSelectedPoseType ||
+  if (input_endpoint.topic_type() != kSelectedPoseType ||
     !QosIsCompatible(input_qos, contract_.input.qos))
   {
+    ++authority_violations_;
+    LatchLocked("SELECTED_PUBLISHER_AUTHORITY_MISMATCH");
+    return;
+  }
+  if (EndpointIdentityIsUnknown(input_endpoint)) {
+    if (state_ == State::kActiveStarting && !bound_input_gid_.has_value()) {
+      reason_code_ = "WAITING_FOR_SELECTED_PUBLISHER_GRAPH_STABILITY";
+    } else {
+      ++authority_violations_;
+      LatchLocked("SELECTED_PUBLISHER_AUTHORITY_MISMATCH");
+    }
+    return;
+  }
+  if (FullyQualifiedNodeName(input_endpoint) != contract_.input.expected_publisher) {
     ++authority_violations_;
     LatchLocked("SELECTED_PUBLISHER_AUTHORITY_MISMATCH");
     return;
@@ -694,7 +814,6 @@ void LocalizationOutputGateway::UpdateGraphLocked()
     LatchLocked("SELECTED_PUBLISHER_GID_CHANGED");
     return;
   }
-  bound_input_gid_ = input_gid;
 
   const auto validate_mavros_publisher = [this](
     const std::string & topic,
@@ -704,7 +823,7 @@ void LocalizationOutputGateway::UpdateGraphLocked()
     std::size_t * publisher_count,
     const std::string & reason_prefix,
     bool (* qos_validator)(const rmw_qos_profile_t &)) {
-      const auto endpoints = get_publishers_info_by_topic(topic);
+      const auto endpoints = GetPublishersInfoByTopic(topic);
       *publisher_count = endpoints.size();
       if (endpoints.empty()) {
         if (bound_gid->has_value()) {
@@ -725,9 +844,21 @@ void LocalizationOutputGateway::UpdateGraphLocked()
       PublisherGid endpoint_gid{};
       std::copy_n(
         endpoint.endpoint_gid().begin(), RMW_GID_STORAGE_SIZE, endpoint_gid.begin());
-      if (FullyQualifiedNodeName(endpoint) != expected_publisher ||
-        endpoint.topic_type() != type || !qos_validator(qos))
-      {
+      if (endpoint.topic_type() != type || !qos_validator(qos)) {
+        ++authority_violations_;
+        LatchLocked(reason_prefix + "_AUTHORITY_MISMATCH");
+        return false;
+      }
+      if (EndpointIdentityIsUnknown(endpoint)) {
+        if (state_ == State::kActiveStarting && !bound_gid->has_value()) {
+          reason_code_ = "WAITING_FOR_" + reason_prefix + "_GRAPH_STABILITY";
+        } else {
+          ++authority_violations_;
+          LatchLocked(reason_prefix + "_AUTHORITY_MISMATCH");
+        }
+        return false;
+      }
+      if (FullyQualifiedNodeName(endpoint) != expected_publisher) {
         ++authority_violations_;
         LatchLocked(reason_prefix + "_AUTHORITY_MISMATCH");
         return false;
@@ -739,7 +870,6 @@ void LocalizationOutputGateway::UpdateGraphLocked()
         LatchLocked(reason_prefix + "_GID_CHANGED");
         return false;
       }
-      *bound_gid = endpoint_gid;
       return true;
     };
 
