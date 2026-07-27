@@ -383,6 +383,7 @@ void LocalizationSourceSelector::OnCandidate(
     const double receive_gap_sec =
       std::chrono::duration<double>(now - last_valid_receive_time_.value()).count();
     if (receive_gap_sec > contract_.health.stale_after_sec) {
+      last_source_pose_.reset();
       state_ = State::kRecovering;
       reason_code_ = "RECOVERING_AFTER_STALE";
       recovery_progress_ = 0U;
@@ -740,6 +741,9 @@ void LocalizationSourceSelector::OnDiagnosticTimer()
     if (age_sec > contract_.health.stale_after_sec &&
       state_ != State::kStale)
     {
+      // The adapter validates source continuity. Preserve alignment and the
+      // epoch, but establish a new step baseline after this observation gap.
+      last_source_pose_.reset();
       state_ = State::kStale;
       reason_code_ = "SOURCE_STALE";
       recovery_progress_ = 0U;

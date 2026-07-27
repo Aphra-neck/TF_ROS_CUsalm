@@ -170,16 +170,19 @@ TEST_F(SelectorLifecycle, StaleSourceRecoversOnlyOnTheBoundEpochWithoutRealignme
 
   SpinFor(executor, 300ms);
   const std::size_t before_recovery = outputs.size();
-  for (int index = 1; index < 10; ++index) {
-    publisher->publish(Message(*source, 10.0 + 0.01 * index));
+  for (int index = 0; index < 9; ++index) {
+    publisher->publish(Message(*source, 10.6 + 0.01 * index));
     SpinFor(executor, 10ms);
     EXPECT_EQ(outputs.size(), before_recovery);
   }
-  publisher->publish(Message(*source, 10.1));
-  SpinFor(executor, 30ms);
+  publisher->publish(Message(*source, 10.69));
+  SpinFor(executor, 80ms);
   ASSERT_EQ(outputs.size(), before_recovery + 1U);
   EXPECT_EQ(outputs.back().localization_epoch_id, epoch);
-  EXPECT_NEAR(outputs.back().pose.position.x, 0.1, 1.0e-8);
+  EXPECT_NEAR(outputs.back().pose.position.x, 0.69, 1.0e-8);
+  EXPECT_EQ(DiagnosticValue(latest_status, "state"), "healthy");
+  EXPECT_EQ(DiagnosticValue(latest_status, "reason_code"), "SOURCE_HEALTHY");
+  EXPECT_EQ(DiagnosticValue(latest_status, "pose_reset"), "0");
 
   auto regressed = Message(*source, 10.4);
   regressed.header.stamp.sec -= 1;
