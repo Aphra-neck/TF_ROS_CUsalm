@@ -95,12 +95,12 @@ protected:
     }
     for (auto & endpoint : endpoints) {
       if (selected_endpoint_identity_ == SelectedEndpointIdentity::kUnknown) {
-        endpoint.node_name("_NODE_NAME_UNKNOWN_");
-        endpoint.node_namespace("_NODE_NAMESPACE_UNKNOWN_");
+        endpoint.node_name() = "_NODE_NAME_UNKNOWN_";
+        endpoint.node_namespace() = "_NODE_NAMESPACE_UNKNOWN_";
       } else if (selected_endpoint_identity_ == SelectedEndpointIdentity::kMismatchedGid) {
         auto gid = endpoint.endpoint_gid();
         gid.front() = static_cast<std::uint8_t>(gid.front() ^ 0xffU);
-        endpoint.endpoint_gid(gid);
+        endpoint.endpoint_gid() = gid;
       }
     }
     return endpoints;
