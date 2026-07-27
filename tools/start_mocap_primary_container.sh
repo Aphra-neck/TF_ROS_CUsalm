@@ -13,6 +13,7 @@ readonly WORKSPACE_SETUP_FILE="${WORKSPACE_SETUP_FILE:-/workspaces/isaac_ros-dev
 readonly WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspaces/isaac_ros-dev}"
 readonly STARTUP_TIMEOUT_SEC="${STARTUP_TIMEOUT_SEC:-30}"
 readonly PROBE_TIMEOUT_SEC="${PROBE_TIMEOUT_SEC:-3}"
+readonly DIAGNOSTIC_PROBE_TIMEOUT_SEC="${DIAGNOSTIC_PROBE_TIMEOUT_SEC:-6}"
 readonly DEPTH_RATE_PROBE_SEC="${DEPTH_RATE_PROBE_SEC:-3}"
 readonly MINIMUM_DEPTH_RATE_HZ="${MINIMUM_DEPTH_RATE_HZ:-80}"
 readonly MAXIMUM_DEPTH_RATE_HZ="${MAXIMUM_DEPTH_RATE_HZ:-100}"
@@ -33,6 +34,7 @@ external_vision_active=0
 armed_stop_warning_issued=0
 last_gateway_published=""
 last_depth_rate_hz=""
+runtime_health_failure="not_checked"
 
 usage()
 {
@@ -239,6 +241,12 @@ require_command()
 bounded()
 {
   timeout --signal=INT --kill-after=1s "${PROBE_TIMEOUT_SEC}s" "$@"
+}
+
+diagnostic_bounded()
+{
+  timeout --signal=INT --kill-after=1s \
+    "${DIAGNOSTIC_PROBE_TIMEOUT_SEC}s" "$@"
 }
 
 topic_count_from_info()
@@ -449,13 +457,13 @@ depth_rate_is_valid()
     2>/dev/null || true)"
   rate="$(printf '%s\n' "$output" |
     awk '/^average rate:/ {rate = $3} END {print rate}')"
+  last_depth_rate_hz="${rate:-unavailable}"
   [[ "$rate" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
   awk \
     -v rate="$rate" \
     -v minimum="$MINIMUM_DEPTH_RATE_HZ" \
     -v maximum="$MAXIMUM_DEPTH_RATE_HZ" \
     'BEGIN {exit !(rate >= minimum && rate <= maximum)}' || return 1
-  last_depth_rate_hz="$rate"
 }
 
 wait_for_depth_ready()
@@ -699,11 +707,7 @@ wait_for_gateway_healthy()
       "${child_pids[$child_index]}" \
       "${child_names[$child_index]}" \
       "${child_logs[$child_index]}"
-    output="$(bounded \
-      ros2 topic echo /diagnostics diagnostic_msgs/msg/DiagnosticArray \
-      --once \
-      --filter "any('localization_output_gateway' in s.name for s in m.status)" \
-      2>/dev/null || true)"
+    output="$(capture_diagnostic localization_output_gateway || true)"
     state="$(diagnostic_value "$output" state)"
     reason="$(diagnostic_value "$output" reason_code)"
     if [ "$state" = "active_healthy" ] &&
@@ -742,10 +746,16 @@ diagnostic_value()
 capture_diagnostic()
 {
   local node_fragment="$1"
-  bounded ros2 topic echo /diagnostics diagnostic_msgs/msg/DiagnosticArray \
+  diagnostic_bounded ros2 topic echo /diagnostics diagnostic_msgs/msg/DiagnosticArray \
     --once \
     --filter "any('${node_fragment}' in s.name for s in m.status)" \
     2>/dev/null
+}
+
+runtime_health_fail()
+{
+  runtime_health_failure="$1"
+  return 1
 }
 
 runtime_health_check()
@@ -760,7 +770,9 @@ runtime_health_check()
   local endpoint_output
   local published
 
-  node_list="$(bounded ros2 node list 2>/dev/null)" || return 1
+  runtime_health_failure="unknown"
+  node_list="$(bounded ros2 node list 2>/dev/null)" ||
+    runtime_health_fail "ROS node graph query timed out" || return 1
   for node in \
     /camera/camera \
     /vrpn_client_node \
@@ -768,7 +780,8 @@ runtime_health_check()
     /localization_source_selector \
     /localization_output_gateway
   do
-    [ "$(printf '%s\n' "$node_list" | grep -Fxc "$node")" = "1" ] || return 1
+    [ "$(printf '%s\n' "$node_list" | grep -Fxc "$node")" = "1" ] ||
+      runtime_health_fail "required node is missing or duplicated: ${node}" || return 1
   done
 
   for node in \
@@ -778,49 +791,76 @@ runtime_health_check()
     /visual_slam_node
   do
     if printf '%s\n' "$node_list" | grep -Fxq "$node"; then
+      runtime_health_fail "forbidden node is running: ${node}"
       return 1
     fi
   done
 
   depth_endpoint="$(bounded ros2 topic info -v \
-    "$YOPO_DEPTH_TOPIC" 2>/dev/null)" || return 1
-  [ "$(topic_count_from_info "$depth_endpoint" Publisher)" = "1" ] || return 1
+    "$YOPO_DEPTH_TOPIC" 2>/dev/null)" ||
+    runtime_health_fail "depth endpoint query timed out: ${YOPO_DEPTH_TOPIC}" || return 1
+  [ "$(topic_count_from_info "$depth_endpoint" Publisher)" = "1" ] ||
+    runtime_health_fail "depth publisher count is not one: ${YOPO_DEPTH_TOPIC}" || return 1
   endpoint_exists_in_info \
-    "$depth_endpoint" camera /camera sensor_msgs/msg/Image PUBLISHER || return 1
+    "$depth_endpoint" camera /camera sensor_msgs/msg/Image PUBLISHER ||
+    runtime_health_fail "depth publisher identity or type changed" || return 1
   depth_message="$(capture_one \
-    "$YOPO_DEPTH_TOPIC" sensor_msgs/msg/Image)" || return 1
-  depth_message_is_valid "$depth_message" || return 1
-  depth_rate_is_valid || return 1
-
-  adapter_output="$(capture_diagnostic mocap_localization_adapter)" || return 1
-  selector_output="$(capture_diagnostic localization_source_selector)" || return 1
-  gateway_output="$(capture_diagnostic localization_output_gateway)" || return 1
-
-  [ "$(diagnostic_value "$adapter_output" health_state)" = "healthy" ] || return 1
-  [ "$(diagnostic_value "$selector_output" state)" = "healthy" ] || return 1
-  [ "$(diagnostic_value "$selector_output" reason_code)" = "SOURCE_HEALTHY" ] ||
+    "$YOPO_DEPTH_TOPIC" sensor_msgs/msg/Image)" ||
+    runtime_health_fail "depth sample was not received before timeout" || return 1
+  depth_message_is_valid "$depth_message" ||
+    runtime_health_fail "depth format, dimensions, frame, or step changed" || return 1
+  depth_rate_is_valid ||
+    runtime_health_fail \
+      "depth rate ${last_depth_rate_hz} Hz is outside configured range" ||
     return 1
-  [ "$(diagnostic_value "$gateway_output" state)" = "active_healthy" ] || return 1
+
+  adapter_output="$(capture_diagnostic mocap_localization_adapter)" ||
+    runtime_health_fail "mocap adapter diagnostic timed out" || return 1
+  selector_output="$(capture_diagnostic localization_source_selector)" ||
+    runtime_health_fail "selector diagnostic timed out" || return 1
+  gateway_output="$(capture_diagnostic localization_output_gateway)" ||
+    runtime_health_fail "gateway diagnostic timed out" || return 1
+
+  [ "$(diagnostic_value "$adapter_output" health_state)" = "healthy" ] ||
+    runtime_health_fail "mocap adapter is not healthy" || return 1
+  [ "$(diagnostic_value "$selector_output" state)" = "healthy" ] ||
+    runtime_health_fail "selector is not healthy" || return 1
+  [ "$(diagnostic_value "$selector_output" reason_code)" = "SOURCE_HEALTHY" ] ||
+    runtime_health_fail "selector reason is not SOURCE_HEALTHY" || return 1
+  [ "$(diagnostic_value "$gateway_output" state)" = "active_healthy" ] ||
+    runtime_health_fail "gateway is not active_healthy" || return 1
   [ "$(diagnostic_value "$gateway_output" reason_code)" = \
-    "EXTERNAL_VISION_PUBLISHED" ] || return 1
+    "EXTERNAL_VISION_PUBLISHED" ] ||
+    runtime_health_fail "gateway is not publishing external vision" || return 1
 
   published="$(diagnostic_value "$gateway_output" published)"
-  [[ "$published" =~ ^[1-9][0-9]*$ ]] || return 1
-  [[ "$last_gateway_published" =~ ^[1-9][0-9]*$ ]] || return 1
-  [ "$published" -gt "$last_gateway_published" ] || return 1
+  [[ "$published" =~ ^[1-9][0-9]*$ ]] ||
+    runtime_health_fail "gateway published counter is invalid" || return 1
+  [[ "$last_gateway_published" =~ ^[1-9][0-9]*$ ]] ||
+    runtime_health_fail "previous gateway published counter is invalid" || return 1
+  [ "$published" -gt "$last_gateway_published" ] ||
+    runtime_health_fail "gateway published counter did not increase" || return 1
   last_gateway_published="$published"
 
   endpoint_output="$(bounded ros2 topic info -v \
-    /mavros/vision_pose/pose_cov 2>/dev/null)" || return 1
-  [ "$(topic_count_from_info "$endpoint_output" Publisher)" = "1" ] || return 1
+    /mavros/vision_pose/pose_cov 2>/dev/null)" ||
+    runtime_health_fail "MAVROS external-vision endpoint query timed out" || return 1
+  [ "$(topic_count_from_info "$endpoint_output" Publisher)" = "1" ] ||
+    runtime_health_fail "external-vision publisher count is not one" || return 1
   endpoint_exists_in_info \
     "$endpoint_output" localization_output_gateway / \
-    geometry_msgs/msg/PoseWithCovarianceStamped PUBLISHER || return 1
+    geometry_msgs/msg/PoseWithCovarianceStamped PUBLISHER ||
+    runtime_health_fail "external-vision publisher identity changed" || return 1
   endpoint_exists_in_info \
     "$endpoint_output" vision_pose /mavros \
-    geometry_msgs/msg/PoseWithCovarianceStamped SUBSCRIPTION || return 1
-  alternate_mavros_inputs_are_clear || return 1
-  mavros_tf_input_is_disabled || return 1
+    geometry_msgs/msg/PoseWithCovarianceStamped SUBSCRIPTION ||
+    runtime_health_fail "MAVROS vision_pose subscription is missing" || return 1
+  alternate_mavros_inputs_are_clear ||
+    runtime_health_fail "an alternate MAVROS vision input has a publisher" || return 1
+  mavros_tf_input_is_disabled ||
+    runtime_health_fail "MAVROS vision_pose TF input is not disabled" || return 1
+
+  runtime_health_failure="none"
 }
 
 verify_external_vision_endpoint()
@@ -904,7 +944,8 @@ monitor_children()
       runtime_fault_reported=0
     else
       health_failures=$((health_failures + 1))
-      log "WARNING: runtime health probe failed (${health_failures}/3)" >&2
+      log "WARNING: runtime health probe failed (${health_failures}/3):" \
+        "${runtime_health_failure}" >&2
       if [ "$health_failures" -ge 3 ] && [ "$runtime_fault_reported" -eq 0 ]; then
         runtime_fault_reported=1
         log "FAULT: localization runtime is not healthy; land and disarm" >&2
@@ -937,6 +978,8 @@ main()
 
   validate_positive_integer STARTUP_TIMEOUT_SEC "$STARTUP_TIMEOUT_SEC"
   validate_positive_integer PROBE_TIMEOUT_SEC "$PROBE_TIMEOUT_SEC"
+  validate_positive_integer \
+    DIAGNOSTIC_PROBE_TIMEOUT_SEC "$DIAGNOSTIC_PROBE_TIMEOUT_SEC"
   validate_positive_integer DEPTH_RATE_PROBE_SEC "$DEPTH_RATE_PROBE_SEC"
   validate_positive_integer MINIMUM_DEPTH_RATE_HZ "$MINIMUM_DEPTH_RATE_HZ"
   validate_positive_integer MAXIMUM_DEPTH_RATE_HZ "$MAXIMUM_DEPTH_RATE_HZ"
@@ -1021,4 +1064,6 @@ main()
   monitor_children
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
