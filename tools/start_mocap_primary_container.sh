@@ -12,9 +12,9 @@ readonly ROS_SETUP_FILE="${ROS_SETUP_FILE:-/opt/ros/humble/setup.bash}"
 readonly WORKSPACE_SETUP_FILE="${WORKSPACE_SETUP_FILE:-/workspaces/isaac_ros-dev/install/setup.bash}"
 readonly WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspaces/isaac_ros-dev}"
 readonly STARTUP_TIMEOUT_SEC="${STARTUP_TIMEOUT_SEC:-30}"
-readonly PROBE_TIMEOUT_SEC="${PROBE_TIMEOUT_SEC:-3}"
+readonly PROBE_TIMEOUT_SEC="${PROBE_TIMEOUT_SEC:-6}"
 readonly DIAGNOSTIC_PROBE_TIMEOUT_SEC="${DIAGNOSTIC_PROBE_TIMEOUT_SEC:-6}"
-readonly DEPTH_RATE_PROBE_SEC="${DEPTH_RATE_PROBE_SEC:-3}"
+readonly DEPTH_RATE_PROBE_SEC="${DEPTH_RATE_PROBE_SEC:-8}"
 readonly MINIMUM_DEPTH_RATE_HZ="${MINIMUM_DEPTH_RATE_HZ:-80}"
 readonly MAXIMUM_DEPTH_RATE_HZ="${MAXIMUM_DEPTH_RATE_HZ:-100}"
 readonly SHUTDOWN_TIMEOUT_SEC="${SHUTDOWN_TIMEOUT_SEC:-8}"
@@ -1064,6 +1064,4 @@ main()
   monitor_children
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  main "$@"
-fi
+main "$@"
