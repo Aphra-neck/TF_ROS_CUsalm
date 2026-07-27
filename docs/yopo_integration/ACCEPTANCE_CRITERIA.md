@@ -32,7 +32,8 @@
 - `LocalizationSourceCandidate` 与 `SelectedPoseCandidate` schema 逐字段匹配 YP-220
   合同，且两者都没有 twist/covariance；
 - `cuvslam_primary` 和 `mocap_primary` 各自只创建选定来源的 pose subscription；
-- 初始 position/yaw 只对齐一次，初始 roll/pitch 不会倾斜 `map` z 轴；
+- cuVSLAM 初始 position/yaw 只对齐一次，初始 roll/pitch 不会倾斜 `map` z 轴；
+- mocap 的全局 position/yaw 必须原样保留，世界变换必须为 identity；
 - mode、publisher GID、source reset 或时间回退不能触发重新对齐或切换来源；
 - graph 中不存在来自 selector 的 odometry、TF、MAVROS、YOPO 或控制 publisher；
 - diagnostics 在 starting、healthy、stale 和 latched fault 状态持续可用。

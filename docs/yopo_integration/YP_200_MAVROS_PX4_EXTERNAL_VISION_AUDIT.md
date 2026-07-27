@@ -141,8 +141,9 @@ covariance、两个 TF suffix frame 和 `ODOMETRY` frame enum 的合同面。已
 [`L127-L154`](https://github.com/mavlink/mavros/blob/c655e6343ec81687d51e7185bcba7a651e361fcd/mavros_extras/src/plugins/vision_pose_estimate.cpp#L127-L154)。
 
 因此 gateway 必须输出 ROS 侧 `map`/`base_link`、右手 z-up/FLU 数据，禁止先手工转为
-NED/FRD；否则会发生二次转换。项目 `map +x` 是 epoch 初始机头而非地理东向，这不
-改变 ROS 边界的轴序合同，也不得据此宣称地理 North/East 已标定。
+NED/FRD；否则会发生二次转换。`cuvslam_primary` 的 `map +x` 是 epoch 初始机头；
+`mocap_primary` 的 `map` 等同动捕固定世界。两者都不构成地理 East/North 声明，
+也不改变 ROS 边界的轴序合同。
 
 重要限制：`vision_pose` callback 不检查 `header.frame_id`，`PoseWithCovarianceStamped`
 也没有 `child_frame_id`。所以 frame 合法性只能由本项目 gateway 在发布前严格验证，

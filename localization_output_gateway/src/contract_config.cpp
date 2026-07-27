@@ -35,7 +35,7 @@ constexpr char kDisabledGatewayContractId[] =
 constexpr char kCuvslamGatewayContractId[] =
   "yopo_cuvslam_primary_output_gateway_20260724_v1";
 constexpr char kMocapGatewayContractId[] =
-  "yopo_mocap_primary_output_gateway_20260724_v1";
+  "yopo_mocap_primary_output_gateway_20260727_v2";
 constexpr char kSelectedPoseType[] =
   "localization_adapter_interfaces/msg/SelectedPoseCandidate";
 
@@ -351,7 +351,7 @@ void ValidateContract(const ContractConfig & contract)
     RequireEqual(
       "input.expected_selector_contract_id",
       contract.input.expected_selector_contract_id,
-      "yopo_mocap_primary_selector_20260724_v1");
+      "yopo_mocap_primary_selector_20260727_v2");
     RequireEqual(
       "input.expected_source_contract_id",
       contract.input.expected_source_contract_id,

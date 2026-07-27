@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 schema_version: 1
-gateway_contract_id: yopo_mocap_primary_output_gateway_20260724_v1
+gateway_contract_id: yopo_mocap_primary_output_gateway_20260727_v2
 profile: mocap_primary
 node:
   expected_fqn: /localization_output_gateway
@@ -14,7 +14,7 @@ input:
   semantic_child_frame: base_link
   authorization: selected_pose_candidate_only
   expected_mode: mocap_primary
-  expected_selector_contract_id: yopo_mocap_primary_selector_20260724_v1
+  expected_selector_contract_id: yopo_mocap_primary_selector_20260727_v2
   expected_source_contract_id: droneyee207_mocap_shadow_20260722_v2
   qos:
     reliability: reliable

@@ -405,7 +405,11 @@ void LocalizationSourceSelector::OnCandidate(
 
   if (!alignment_.has_value()) {
     try {
-      alignment_.emplace(message->pose);
+      if (mode_ == "mocap_primary") {
+        alignment_ = YawAlignment::Identity();
+      } else {
+        alignment_.emplace(message->pose);
+      }
     } catch (const std::exception &) {
       ++rejected_;
       ++quaternion_violation_;
@@ -816,6 +820,9 @@ void LocalizationSourceSelector::PublishDiagnosticsLocked(const SteadyTime & now
       "last_valid_receive_age_sec",
       receive_age.has_value() ? std::to_string(receive_age.value()) : "not_received"),
     Value("alignment_locked", alignment_.has_value()),
+    Value(
+      "pose_reference_semantics",
+      mode_ == "mocap_primary" ? "global_mocap_world" : "epoch_local_initial_pose"),
     Value(
       "alignment_yaw_map_from_source_rad",
       alignment_.has_value() ?

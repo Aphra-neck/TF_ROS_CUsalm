@@ -26,7 +26,7 @@ cuvslam_localization_adapter             mocap_localization_adapter
                               |
                               v
                 localization_source_selector
-          one subscription, one yaw-only map alignment
+       one subscription, mode-specific map transform
                               |
                               v
                  /localization/selected/pose
@@ -64,9 +64,10 @@ T[base_link,camera_link]:
 `T[odom,camera_link]` 转换为 `T[odom,base_link]`，不能只修改 frame 名称。动捕刚体
 中心、飞控 IMU 和 `base_link` 重合，不得重复施加杠杆臂补偿。
 
-`map` 是每个 localization epoch 新建的局部右手 z-up 世界：初始位置为原点，初始
-机头为 `+x`，左侧为 `+y`。selector 只在 epoch 开始时计算一次 yaw-only
-`T[map,source_world]`，不把初始 roll/pitch 固化到世界 z 轴，也不在运行中重新对齐。
+`map` 的来源语义由启动模式固定。`cuvslam_primary` 在每个 localization epoch
+以首帧建立局部右手 z-up 世界：初始位置为原点、初始机头为 `+x`、左侧为 `+y`。
+`mocap_primary` 则令 `map == mocap_world`，使用固定 identity 变换并保留动捕定义的
+绝对 position 和 yaw；不得用无人机启动位置重新建立动捕世界原点。
 
 详细 frame 和时间语义见
 [`INTERFACE_CONTRACTS.md`](docs/yopo_integration/INTERFACE_CONTRACTS.md)。
@@ -104,7 +105,7 @@ YOPO control 或 flight authority。非主来源可以继续留下 source-privat
 | `localization_adapter_interfaces` | `ShadowPoseCandidate`、`LocalizationSourceCandidate` 和 `SelectedPoseCandidate` |
 | `cuvslam_localization_adapter` | cuVSLAM camera pose 到 `base_link` source candidate |
 | `mocap_localization_adapter` | VRPN pose 校验、mocap source candidate 和 shadow evidence |
-| `localization_source_selector` | 启动时单源订阅、一次 yaw-only 对齐和 selected pose seam |
+| `localization_source_selector` | 启动时单源订阅、模式固定的 map 变换和 selected pose seam |
 | `localization_output_gateway` | 默认禁用的 pose-only MAVROS 输出门禁；YP-230 TDD 中 |
 | `bag_contract_probe` | 对固定 rosbag 执行只读、确定性的合同审计 |
 

@@ -123,3 +123,12 @@ ROS 2 `yopo_node` 的执行路径中；不对其重复安装 Jetson PyTorch。
 
 **验证要求：** 先只读采集不少于 60 秒的 MAVROS state/timesync，再固定 gateway
 freshness、RTT、offset jitter 等阈值；禁止直接继承 selector 的健康阈值。
+
+## D-020：动捕保留固定全局世界
+
+**决策：** `mocap_primary` 令 `map == mocap_world`，固定使用 identity 世界变换，
+原样保留动捕系统定义的绝对 position 和 yaw。只有 `cuvslam_primary` 使用首帧位置
+归零和 yaw-only 局部对齐。本条在 mocap 模式下替代 D-003。
+
+**理由：** 动捕是固定实验室世界中的全局定位源；用无人机上电位置重新定义原点会
+把它错误降级为 VIO 式相对定位，并破坏跨启动一致的绝对坐标语义。

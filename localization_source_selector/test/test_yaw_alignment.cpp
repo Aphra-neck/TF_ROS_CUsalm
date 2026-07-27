@@ -82,6 +82,26 @@ TEST(YawAlignment, InitialPositionAndYawBecomeZeroWithoutRemovingRollPitch)
   EXPECT_NEAR(std::abs(expected.dot(actual)), 1.0, 1.0e-12);
 }
 
+TEST(YawAlignment, IdentityPreservesGlobalPositionAndOrientation)
+{
+  const auto source = Pose(2.0, 4.0, 0.5, 0.17, -0.11, 0.6);
+  const auto output = YawAlignment::Identity().Transform(source);
+
+  EXPECT_NEAR(output.position.x, source.position.x, 1.0e-12);
+  EXPECT_NEAR(output.position.y, source.position.y, 1.0e-12);
+  EXPECT_NEAR(output.position.z, source.position.z, 1.0e-12);
+  const Eigen::Quaterniond expected(
+    source.orientation.w, source.orientation.x,
+    source.orientation.y, source.orientation.z);
+  const Eigen::Quaterniond actual(
+    output.orientation.w, output.orientation.x,
+    output.orientation.y, output.orientation.z);
+  EXPECT_NEAR(std::abs(expected.dot(actual)), 1.0, 1.0e-12);
+  EXPECT_NEAR(YawAlignment::Identity().YawMapFromSource(), 0.0, 1.0e-12);
+  EXPECT_NEAR(
+    YawAlignment::Identity().TranslationMapFromSource().norm(), 0.0, 1.0e-12);
+}
+
 TEST(YawAlignment, LockedTransformMapsInitialHeadingToMapPositiveX)
 {
   constexpr double kHalfPi = 1.57079632679489661923;

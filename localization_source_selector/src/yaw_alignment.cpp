@@ -96,6 +96,13 @@ double PoseStepRotation(
   return 2.0 * std::acos(dot);
 }
 
+YawAlignment YawAlignment::Identity()
+{
+  geometry_msgs::msg::Pose identity_pose;
+  identity_pose.orientation.w = 1.0;
+  return YawAlignment(identity_pose);
+}
+
 YawAlignment::YawAlignment(const geometry_msgs::msg::Pose & initial_pose)
 : yaw_map_from_source_(0.0),
   rotation_map_from_source_(Eigen::Quaterniond::Identity()),

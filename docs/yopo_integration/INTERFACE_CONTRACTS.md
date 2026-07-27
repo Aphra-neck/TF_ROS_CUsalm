@@ -15,7 +15,7 @@ T[A,C] = T[A,B] * T[B,C]
 
 | Frame | 定义 | 生命周期 |
 | --- | --- | --- |
-| `map` | 起飞局部世界；初始机头 +x、左 +y、上 +z | 每个 localization epoch 重建一次 |
+| `map` | 模式固定世界：cuVSLAM 为起飞局部世界，mocap 等同 `mocap_world` | cuVSLAM epoch 或动捕标定周期 |
 | `odom` | cuVSLAM 连续局部世界，初始 yaw 可任意 | cuVSLAM epoch |
 | `mocap_world` | 动捕固定实验室世界，右手、z-up | 动捕标定周期 |
 | `base_link` | 项目机体参考点，FLU | 固定安装 |
@@ -24,8 +24,9 @@ T[A,C] = T[A,B] * T[B,C]
 | `camera_link` | D435 机身参考点，FLU | 固定安装 |
 | optical frames | x 右、y 下、z 前 | RealSense 驱动合同 |
 
-`map` 是局部右手 z-up 世界，不是本阶段的地理 ENU 声明。ROS 数据进入 MAVROS
-时仍使用经审计的 ROS ENU/FLU 边界表达，最终 NED/FRD 转换只由 MAVROS 完成。
+`map` 是右手 z-up 世界；cuVSLAM 模式下为局部世界，mocap 模式下为固定实验室世界，
+均不是本阶段的地理 ENU 声明。ROS 数据进入 MAVROS 时仍使用经审计的 ROS ENU/FLU
+边界表达，最终 NED/FRD 转换只由 MAVROS 完成。
 
 ## 3. 固定安装变换
 
@@ -48,20 +49,25 @@ T[odom,base_link]
 
 不得只把 `child_frame_id` 从 `camera_link` 改成 `base_link`。
 
-## 4. Epoch 对齐
+## 4. 模式固定的世界变换
 
-启动时将当前 `base_link` 位置设为 `map` 原点，并只使用水平 yaw 建立对齐，
-避免把起飞时的轻微 roll/pitch 倾斜固化到世界 z 轴。
-
-对于来源世界 S（`odom`、`mocap_world` 或 MAVROS local frame）：
+`cuvslam_primary` 启动时将当前 `base_link` 位置设为 `map` 原点，并只使用水平 yaw
+建立对齐，避免把起飞时的轻微 roll/pitch 倾斜固化到世界 z 轴：
 
 ```text
-yaw_map_from_source = -yaw(T[S,base_link]_initial)
-R[map,S] = Rz(yaw_map_from_source)
-t[map,S] = -R[map,S] * p[S,base_link]_initial
+yaw_map_from_odom = -yaw(T[odom,base_link]_initial)
+R[map,odom] = Rz(yaw_map_from_odom)
+t[map,odom] = -R[map,odom] * p[odom,base_link]_initial
 ```
 
-得到的 `T[map,S]` 在当前 epoch 内必须保持常量。定位源重启、GID 改变、时间回退、
+`mocap_primary` 不执行首帧归零或 yaw 对齐。项目把动捕世界直接定义为全局 `map`：
+
+```text
+T[map,mocap_world] = identity
+T[map,base_link] = T[mocap_world,base_link]
+```
+
+选定模式的变换在当前 epoch 内必须保持常量。定位源重启、GID 改变、时间回退、
 Pose reset 或模式改变都必须结束当前 epoch。
 
 ## 5. 定位模式与发布权
@@ -87,7 +93,7 @@ Pose reset 或模式改变都必须结束当前 epoch。
 `YP-220` 采用方案 A。selector 只为启动时选定的一个来源创建 pose subscription，
 不订阅另一个来源，也不在运行中创建或替换 subscription。选定来源必须先由其
 source adapter 形成 `T[source_world,base_link]`，selector 再按第 4 节公式计算一次
-yaw-only `T[map,source_world]` 并在整个 localization epoch 内锁定。
+模式固定的 `T[map,source_world]` 并在整个 localization epoch 内锁定。
 
 selector 的唯一 pose 输出是：
 

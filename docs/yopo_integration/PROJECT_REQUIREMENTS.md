@@ -66,9 +66,9 @@ epoch 的 `map -> base_link`，保留来源采样时间且不包含 twist/covari
 字符串 `mode` 和 `source_contract_id` 固定，不使用 source enum。完整双模式系统
 launch 由 `YP-250` 交付，不能用单独 selector 节点启动代替。
 
-### REQ-F-003：局部地图
+### REQ-F-003：模式固定的地图语义
 
-每次 localization epoch 建立一个起飞局部 `map`：
+`cuvslam_primary` 每次 localization epoch 建立一个起飞局部 `map`：
 
 - 起飞位置为原点；
 - 初始机头为 `+x`；
@@ -76,12 +76,13 @@ launch 由 `YP-250` 交付，不能用单独 selector 节点启动代替。
 - 上方为 `+z`；
 - 对齐只计算一次并在整个 epoch 内锁定。
 
-首版不宣称 `map +x` 是真实地理东向。
+`mocap_primary` 令 `map == mocap_world`，保留动捕系统定义的绝对 XYZ 和 yaw，
+`T[map,mocap_world]` 固定为 identity。首版不宣称任一模式的 `map +x` 是真实地理东向。
 
 ### REQ-F-004：定位职责
 
 定位 adapter 负责来源特有的读取、校验和固定安装变换；selector 负责启动时来源
-互斥、一次 yaw-only `map` 对齐和 pose-only selected seam；gateway 只负责把获批的
+互斥、模式固定的 `map` 变换和 pose-only selected seam；gateway 只负责把获批的
 selected pose 门禁到 PX4 pose-only 输入。三者不得通过 Pose 差分建立新的飞行速度
 估计器。
 

@@ -330,7 +330,7 @@ void ValidateModeContract(const ContractConfig & contract, const std::string & r
   } else {
     RequireEqual(
       "selector_contract_id", contract.selector_contract_id,
-      "yopo_mocap_primary_selector_20260724_v1");
+      "yopo_mocap_primary_selector_20260727_v2");
     RequireEqual(
       "input.topic", contract.input.topic,
       "/localization/candidates/mocap/base_pose");

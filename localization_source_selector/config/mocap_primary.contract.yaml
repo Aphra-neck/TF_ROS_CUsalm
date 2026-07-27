@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 schema_version: 1
-selector_contract_id: yopo_mocap_primary_selector_20260724_v1
+selector_contract_id: yopo_mocap_primary_selector_20260727_v2
 mode: mocap_primary
 input:
   topic: /localization/candidates/mocap/base_pose

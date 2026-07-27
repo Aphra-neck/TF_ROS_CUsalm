@@ -21,6 +21,8 @@ readonly SHUTDOWN_TIMEOUT_SEC="${SHUTDOWN_TIMEOUT_SEC:-8}"
 readonly LOCK_FILE="${MOCAP_PRIMARY_LOCK_FILE:-/tmp/yopo_mocap_primary_container.lock}"
 readonly D435_SERIAL="${D435_SERIAL-243622070369}"
 readonly YOPO_DEPTH_TOPIC="${YOPO_DEPTH_TOPIC:-/depth_image}"
+readonly EXPECTED_SELECTOR_CONTRACT_ID="yopo_mocap_primary_selector_20260727_v2"
+readonly EXPECTED_GATEWAY_CONTRACT_ID="yopo_mocap_primary_output_gateway_20260727_v2"
 
 declare -a child_names=()
 declare -a child_pids=()
@@ -698,8 +700,11 @@ wait_for_gateway_healthy()
   local child_index="$1"
   local deadline=$((SECONDS + STARTUP_TIMEOUT_SEC))
   local output
+  local selector_output
   local state
   local reason
+  local selector_contract_id
+  local gateway_contract_id
 
   log "Waiting for active gateway diagnostics"
   while [ "$SECONDS" -lt "$deadline" ]; do
@@ -707,14 +712,29 @@ wait_for_gateway_healthy()
       "${child_pids[$child_index]}" \
       "${child_names[$child_index]}" \
       "${child_logs[$child_index]}"
+    selector_output="$(capture_diagnostic localization_source_selector || true)"
     output="$(capture_diagnostic localization_output_gateway || true)"
     state="$(diagnostic_value "$output" state)"
     reason="$(diagnostic_value "$output" reason_code)"
-    if [ "$state" = "active_healthy" ] &&
+    selector_contract_id="$(diagnostic_value "$selector_output" selector_contract_id)"
+    gateway_contract_id="$(diagnostic_value "$output" gateway_contract_id)"
+    if [ -n "$selector_contract_id" ] &&
+      [ "$selector_contract_id" != "$EXPECTED_SELECTOR_CONTRACT_ID" ]; then
+      printf '%s\n' "$selector_output" >&2
+      stop "selector contract is not the required global-mocap v2 contract"
+    fi
+    if [ -n "$gateway_contract_id" ] &&
+      [ "$gateway_contract_id" != "$EXPECTED_GATEWAY_CONTRACT_ID" ]; then
+      printf '%s\n' "$output" >&2
+      stop "gateway contract is not the required global-mocap v2 contract"
+    fi
+    if selector_global_identity_is_valid "$selector_output" &&
+      gateway_v2_contract_is_valid "$output" &&
+      [ "$state" = "active_healthy" ] &&
       [ "$reason" = "EXTERNAL_VISION_PUBLISHED" ]; then
       last_gateway_published="$(diagnostic_value "$output" published)"
       if [[ "$last_gateway_published" =~ ^[1-9][0-9]*$ ]]; then
-        log "Gateway is active and publishing external-vision pose"
+        log "Global-mocap v2 selector and gateway are publishing external-vision pose"
         return
       fi
     fi
@@ -724,8 +744,10 @@ wait_for_gateway_healthy()
     fi
     sleep 1
   done
+  printf '%s\n' "$selector_output" >&2
+  printf '%s\n' "$output" >&2
   show_child_log "${child_names[$child_index]}" "${child_logs[$child_index]}"
-  stop "gateway did not become healthy within ${STARTUP_TIMEOUT_SEC}s"
+  stop "global-mocap v2 selector/gateway did not become healthy within ${STARTUP_TIMEOUT_SEC}s"
 }
 
 diagnostic_value()
@@ -741,6 +763,40 @@ diagnostic_value()
       exit
     }
   '
+}
+
+diagnostic_value_is_zero()
+{
+  [[ "$1" =~ ^-?0+([.][0]+)?$ ]]
+}
+
+selector_global_identity_is_valid()
+{
+  local output="$1"
+  [ "$(diagnostic_value "$output" state)" = "healthy" ] &&
+    [ "$(diagnostic_value "$output" reason_code)" = "SOURCE_HEALTHY" ] &&
+    [ "$(diagnostic_value "$output" selector_contract_id)" = \
+      "$EXPECTED_SELECTOR_CONTRACT_ID" ] &&
+    [ "$(diagnostic_value "$output" pose_reference_semantics)" = \
+      "global_mocap_world" ] &&
+    [ "$(diagnostic_value "$output" alignment_locked)" = "1" ] &&
+    diagnostic_value_is_zero \
+      "$(diagnostic_value "$output" alignment_yaw_map_from_source_rad)" &&
+    diagnostic_value_is_zero \
+      "$(diagnostic_value "$output" alignment_translation_x_m)" &&
+    diagnostic_value_is_zero \
+      "$(diagnostic_value "$output" alignment_translation_y_m)" &&
+    diagnostic_value_is_zero \
+      "$(diagnostic_value "$output" alignment_translation_z_m)"
+}
+
+gateway_v2_contract_is_valid()
+{
+  local output="$1"
+  [ "$(diagnostic_value "$output" gateway_contract_id)" = \
+    "$EXPECTED_GATEWAY_CONTRACT_ID" ] &&
+    [ "$(diagnostic_value "$output" expected_selector_contract_id)" = \
+      "$EXPECTED_SELECTOR_CONTRACT_ID" ]
 }
 
 capture_diagnostic()
@@ -827,11 +883,15 @@ runtime_health_check()
     runtime_health_fail "selector is not healthy" || return 1
   [ "$(diagnostic_value "$selector_output" reason_code)" = "SOURCE_HEALTHY" ] ||
     runtime_health_fail "selector reason is not SOURCE_HEALTHY" || return 1
+  selector_global_identity_is_valid "$selector_output" ||
+    runtime_health_fail "selector global-mocap v2 identity semantics are invalid" || return 1
   [ "$(diagnostic_value "$gateway_output" state)" = "active_healthy" ] ||
     runtime_health_fail "gateway is not active_healthy" || return 1
   [ "$(diagnostic_value "$gateway_output" reason_code)" = \
     "EXTERNAL_VISION_PUBLISHED" ] ||
     runtime_health_fail "gateway is not publishing external vision" || return 1
+  gateway_v2_contract_is_valid "$gateway_output" ||
+    runtime_health_fail "gateway global-mocap v2 contract is invalid" || return 1
 
   published="$(diagnostic_value "$gateway_output" published)"
   [[ "$published" =~ ^[1-9][0-9]*$ ]] ||

@@ -19,8 +19,9 @@ control_authority=DENIED
 ```
 
 本合同固定 `YP-220` 的方案 A：`localization_source_selector` 是启动时数据选择
-module。它只订阅当前 launch 明确选定的定位源，在 module 内完成一次 yaw-only
-局部 `map` 对齐，并通过一个小而类型受限的 interface 发布 pose candidate。
+module。它只订阅当前 launch 明确选定的定位源，在 module 内应用模式固定的 `map`
+语义：cuVSLAM 首帧建立局部世界，mocap 使用固定 identity 世界变换；随后通过一个
+小而类型受限的 interface 发布 pose candidate。
 
 selector 不是定位融合器、速度估计器或 PX4 gateway。本合同只允许开始实现和测试，
 不构成 Gate G3、外部视觉、OFFBOARD、解锁、控制或飞行授权。
@@ -38,7 +39,7 @@ selector 不是定位融合器、速度估计器或 PX4 gateway。本合同只�
 topic、原始世界 frame、50 mm 相机外参、动捕刚体语义、输入 publisher identity、
 时间和健康门禁都隐藏在 selector implementation 及其版本化 mode 配置中。
 
-删除 selector 后，启动时互斥、来源合同校验、一次对齐、epoch 锁定和 fail-closed
+删除 selector 后，启动时互斥、来源合同校验、模式变换、epoch 锁定和 fail-closed
 行为会重新散落到 gateway 与 launch，因此该 module 不是简单 topic pass-through。
 
 ## 2. 启动模式
@@ -115,34 +116,42 @@ interface 的完整不变量如下：
 - 消息没有 twist、twist covariance 或 pose covariance 字段；
 - 消息类型必须与 `nav_msgs/msg/Odometry`、MAVROS pose 输入和 TF 不兼容；
 - `mode` 必须为当前 read-only 启动值；
-- `authorization` 必须精确为 `selected_pose_candidate_only`；它只表示“经启动选择和
-  局部对齐的 pose candidate”，不携带 PX4、控制或飞行 authorization。
+- `authorization` 必须精确为 `selected_pose_candidate_only`；它只表示“经启动选择并
+  应用当前模式固定世界语义的 pose candidate”，不携带 PX4、控制或飞行 authorization。
 
 未知 mode、空 contract ID、空 epoch ID、错误 authorization、错误 frame、非有限
 position、无效 quaternion 或时间合同失败时不得发布。首版 `selector_contract_id`
 按启动模式精确绑定配置：
 
 - `cuvslam_primary`：`yopo_cuvslam_primary_selector_20260724_v1`；
-- `mocap_primary`：`yopo_mocap_primary_selector_20260724_v1`。
+- `mocap_primary`：`yopo_mocap_primary_selector_20260727_v2`。
 
 两个 ID 分别绑定各自的 input topic、publisher、source contract 和 parent frame，禁止
 跨模式复用。
 
-## 4. 一次 yaw-only `map` 对齐
+## 4. 模式固定的 `map` 语义
 
-令选定来源的世界 frame 为 `S`。首个通过 publisher、contract、frame、stamp、数值和
-健康门禁的 `T[S,base_link]` 样本建立当前 localization epoch：
+`cuvslam_primary` 的首个有效 `T[odom,base_link]` 样本建立局部 epoch：
 
 ```text
-yaw_map_from_source = -yaw(T[S,base_link]_initial)
-R[map,S] = Rz(yaw_map_from_source)
-t[map,S] = -R[map,S] * p[S,base_link]_initial
+yaw_map_from_odom = -yaw(T[odom,base_link]_initial)
+R[map,odom] = Rz(yaw_map_from_odom)
+t[map,odom] = -R[map,odom] * p[odom,base_link]_initial
 
-T[map,base_link] = T[map,S] * T[S,base_link]
+T[map,base_link] = T[map,odom] * T[odom,base_link]
 ```
 
 只使用初始 yaw 建立世界旋转，不把初始 roll/pitch 固化到 `map` z 轴。初始位置变为
 `[0,0,0]`，初始机头变为 `map +x`；后续 pose 仍保留来源测得的 roll/pitch。
+
+`mocap_primary` 使用动捕定义的固定全局世界，不从首帧推导任何平移或 yaw：
+
+```text
+T[map,mocap_world] = identity
+T[map,base_link] = T[mocap_world,base_link]
+```
+
+因此动捕报告 `[2,4,0]` 时，selected pose 也必须报告 `[2,4,0]`，并保留绝对 yaw。
 
 `T[map,S]` 计算一次后必须锁定。selector 不得持续重新对齐、平滑修改原点或因短时
 stale 改用另一来源。selector 进程存活期间，以下事件结束当前 epoch 并锁存停止
@@ -202,7 +211,8 @@ diagnostics 可以说明 candidate 健康，但不得声明 MAVROS、OFFBOARD、
 - 两个 mode 分别只创建选定来源的 pose subscription；
 - 未选来源持续健康时也不能产生交叉 subscription 或切换；
 - 前进、左移、上升和 yaw 输入证明输出为正确的 `map -> base_link`；
-- 初始非零 position/yaw 被一次对齐，初始 roll/pitch 不会倾斜 `map` z 轴；
+- cuVSLAM 初始非零 position/yaw 被一次对齐，初始 roll/pitch 不会倾斜 `map` z 轴；
+- mocap 的绝对 position/yaw 原样保留，且 diagnostics 报告 identity 世界变换；
 - 后续样本不能修改锁定的 `T[map,S]`；
 - mode 修改、source reset、GID 改变、重复 publisher、stale、frame 和时间错误均
   fail closed；

@@ -95,7 +95,8 @@ if(BUILD_TESTING)
   foreach(test_name IN ITEMS
       test_selector_node_contract
       test_selector_authority
-      test_selector_lifecycle)
+      test_selector_lifecycle
+      test_selector_pose_semantics)
     ament_add_gtest(${test_name} test/${test_name}.cpp)
     if(TARGET ${test_name})
       target_link_libraries(${test_name} ${PROJECT_NAME}_core)
@@ -118,6 +119,9 @@ if(BUILD_TESTING)
     TIMEOUT 30)
   set_tests_properties(test_selector_node_contract PROPERTIES
     ENVIRONMENT "ROS_DOMAIN_ID=228;ROS_LOCALHOST_ONLY=1"
+    TIMEOUT 30)
+  set_tests_properties(test_selector_pose_semantics PROPERTIES
+    ENVIRONMENT "ROS_DOMAIN_ID=233;ROS_LOCALHOST_ONLY=1"
     TIMEOUT 30)
 endif()
 

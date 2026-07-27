@@ -159,7 +159,7 @@ SelectedPoseCandidate Candidate(rclcpp::Node & source)
     message.selector_contract_id = "yopo_cuvslam_primary_selector_20260724_v1";
     message.source_contract_id = "d435i_fcu_cuvslam_shadow_20260723_v2";
   } else {
-    message.selector_contract_id = "yopo_mocap_primary_selector_20260724_v1";
+    message.selector_contract_id = "yopo_mocap_primary_selector_20260727_v2";
     message.source_contract_id = "droneyee207_mocap_shadow_20260722_v2";
   }
   return message;

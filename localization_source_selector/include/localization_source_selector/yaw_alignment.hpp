@@ -34,6 +34,7 @@ double PoseStepRotation(
 class YawAlignment final
 {
 public:
+  static YawAlignment Identity();
   explicit YawAlignment(const geometry_msgs::msg::Pose & initial_pose);
 
   geometry_msgs::msg::Pose Transform(const geometry_msgs::msg::Pose & source_pose) const;
