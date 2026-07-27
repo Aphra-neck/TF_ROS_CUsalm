@@ -1,0 +1,41 @@
+# Copyright (c) 2026 u5-4
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+selector_contract_id: substituted_selector_contract
+mode: cuvslam_primary
+input:
+  topic: /localization/candidates/cuvslam/base_pose
+  type: localization_adapter_interfaces/msg/LocalizationSourceCandidate
+  expected_publisher: /cuvslam_localization_adapter
+  source_id: cuvslam
+  source_contract_id: substituted_source_contract
+  parent_frame: substituted_world
+  semantic_child_frame: base_link
+  authorization: source_pose_candidate_only
+  qos:
+    reliability: reliable
+    durability: volatile
+    history: keep_last
+    depth: 10
+    allow_rmw_unknown_history: true
+output:
+  topic: /localization/selected/pose
+  type: localization_adapter_interfaces/msg/SelectedPoseCandidate
+  expected_publisher: /localization_source_selector
+  parent_frame: map
+  semantic_child_frame: base_link
+  authorization: selected_pose_candidate_only
+  qos:
+    reliability: reliable
+    durability: volatile
+    history: keep_last
+    depth: 10
+    allow_rmw_unknown_history: true
+health:
+  diagnostic_period_sec: 0.02
+  stale_after_sec: 0.12
+  maximum_clock_residual_sec: 0.50
+  maximum_position_step_m: 2.00
+  maximum_rotation_step_deg: 90.0
+  recovery_consecutive_samples: 3

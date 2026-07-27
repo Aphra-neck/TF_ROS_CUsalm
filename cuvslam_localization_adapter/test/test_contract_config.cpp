@@ -14,6 +14,9 @@
 
 #include <gtest/gtest.h>
 
+#include <Eigen/Core>
+
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -30,6 +33,86 @@ namespace
 std::string Fixture(const std::string & name)
 {
   return std::string(TEST_FIXTURE_DIR) + "/" + name;
+}
+
+std::string Config(const std::string & name)
+{
+  return std::string(TEST_CONFIG_DIR) + "/" + name;
+}
+
+TEST(ContractConfig, ProductionContractLocksApprovedAirframeExtrinsic)
+{
+  const ContractConfig contract =
+    LoadContractConfig(Config("contract_blocked.yaml"));
+
+  EXPECT_EQ(contract.contract_id, "d435i_fcu_cuvslam_shadow_20260723_v2");
+  EXPECT_EQ(contract.status, "blocked");
+  ASSERT_TRUE(contract.extrinsic.Approved());
+  ASSERT_TRUE(contract.extrinsic.transform.has_value());
+  ASSERT_TRUE(contract.extrinsic.provenance.has_value());
+  EXPECT_EQ(contract.extrinsic.parent_frame, "base_link");
+  EXPECT_EQ(contract.extrinsic.child_frame, "camera_link");
+  EXPECT_EQ(
+    contract.extrinsic.provenance.value(),
+    "airframe_measurement/user_confirmed_20260723_camera_50mm_forward");
+
+  const auto & transform = contract.extrinsic.transform.value();
+  EXPECT_TRUE(transform.Translation().isApprox(Eigen::Vector3d(0.05, 0.0, 0.0)));
+  EXPECT_DOUBLE_EQ(transform.RotationXyzw().x, 0.0);
+  EXPECT_DOUBLE_EQ(transform.RotationXyzw().y, 0.0);
+  EXPECT_DOUBLE_EQ(transform.RotationXyzw().z, 0.0);
+  EXPECT_DOUBLE_EQ(transform.RotationXyzw().w, 1.0);
+
+  EXPECT_FALSE(contract.twist.Approved());
+  EXPECT_FALSE(contract.covariance.Approved());
+  EXPECT_EQ(
+    contract.authorization,
+    localization_contracts::AuthorizationState::kShadowOnly);
+
+  const auto decision = localization_contracts::EvaluateLocalizationPublishGate(
+    "shadow",
+    localization_contracts::HealthState::kHealthy,
+    contract.authorization,
+    contract.Approvals());
+  EXPECT_FALSE(decision.publish);
+  EXPECT_EQ(
+    std::find(
+      decision.reasons.begin(), decision.reasons.end(),
+      "EXTRINSIC_UNAPPROVED"),
+    decision.reasons.end());
+  EXPECT_NE(
+    std::find(
+      decision.reasons.begin(), decision.reasons.end(),
+      "AUTHORIZATION_SHADOW_ONLY"),
+    decision.reasons.end());
+  EXPECT_NE(
+    std::find(
+      decision.reasons.begin(), decision.reasons.end(),
+      "TWIST_SEMANTICS_UNAPPROVED"),
+    decision.reasons.end());
+  EXPECT_NE(
+    std::find(
+      decision.reasons.begin(), decision.reasons.end(),
+      "COVARIANCE_UNAPPROVED"),
+    decision.reasons.end());
+}
+
+TEST(ContractConfig, ProductionExtrinsicConvertsCameraPoseWithCorrectSign)
+{
+  const ContractConfig contract =
+    LoadContractConfig(Config("contract_blocked.yaml"));
+  ASSERT_TRUE(contract.extrinsic.transform.has_value());
+
+  const auto odom_from_camera = localization_contracts::RigidTransform::Create(
+    "odom", "camera_link", Eigen::Vector3d(1.05, 2.0, 3.0),
+    localization_contracts::QuaternionXyzw{0.0, 0.0, 0.0, 1.0});
+  const auto odom_from_base = localization_contracts::CameraPoseToBasePose(
+    odom_from_camera, contract.extrinsic.transform.value());
+
+  EXPECT_EQ(odom_from_base.ParentFrame(), "odom");
+  EXPECT_EQ(odom_from_base.ChildFrame(), "base_link");
+  EXPECT_TRUE(
+    odom_from_base.Translation().isApprox(Eigen::Vector3d(1.0, 2.0, 3.0)));
 }
 
 TEST(ContractConfig, LoadsSyntheticExtrinsicInShadowOnlyContract)

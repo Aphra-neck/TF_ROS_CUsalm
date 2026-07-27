@@ -99,6 +99,32 @@ TEST(RigidTransform, QuaternionSignIsEquivalent)
     NumericContractViolation);
 }
 
+TEST(RigidTransform, ResolvesSmallAnglesForBothQuaternionSigns)
+{
+  constexpr double small_angle_rad = 1.0e-10;
+  const auto reference = RigidTransform::Create(
+    "a", "b", Eigen::Vector3d::Zero(),
+    QuaternionXyzw{0.0, 0.0, 0.0, 1.0});
+  const Eigen::Quaterniond small_rotation(
+    Eigen::AngleAxisd(small_angle_rad, Eigen::Vector3d::UnitX()));
+  const QuaternionXyzw small_rotation_xyzw = ToRos(small_rotation);
+  const auto positive = RigidTransform::Create(
+    "a", "b", Eigen::Vector3d::Zero(), small_rotation_xyzw);
+  const auto negative = RigidTransform::Create(
+    "a", "b", Eigen::Vector3d::Zero(),
+    QuaternionXyzw{
+        -small_rotation_xyzw.x,
+        -small_rotation_xyzw.y,
+        -small_rotation_xyzw.z,
+        -small_rotation_xyzw.w});
+
+  EXPECT_TRUE(reference.IsEquivalent(positive, 0.0, 2.0e-10));
+  EXPECT_TRUE(reference.IsEquivalent(negative, 0.0, 2.0e-10));
+  EXPECT_FALSE(reference.IsEquivalent(positive, 0.0, 5.0e-11));
+  EXPECT_FALSE(reference.IsEquivalent(negative, 0.0, 5.0e-11));
+  EXPECT_TRUE(positive.IsEquivalent(negative, 0.0, 0.0));
+}
+
 TEST(RigidTransform, RejectsDisconnectedAndInconsistentChains)
 {
   const auto first = RigidTransform::Create(

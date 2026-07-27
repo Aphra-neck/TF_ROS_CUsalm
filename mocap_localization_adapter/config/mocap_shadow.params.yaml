@@ -1,0 +1,44 @@
+# Copyright (c) 2026 u5-4
+# SPDX-License-Identifier: Apache-2.0
+
+mocap_localization_adapter:
+  ros__parameters:
+    contract_id: droneyee207_mocap_shadow_20260722_v2
+    source_revision: vrpn_client_ros2@1b9731c
+    mode: shadow
+    authorization: shadow_candidate_only
+
+    input_topic: /droneyee207/pose
+    expected_publisher: /vrpn_client_node
+    expected_input_frame: world
+    semantic_input_child_frame: mocap_rigid_body
+
+    output_topic: /localization/shadow/mocap/assumed_base_pose
+    output_parent_frame: mocap_world
+    output_child_frame: base_link
+    diagnostics_topic: /diagnostics
+
+    world_axes: right_handed_x_reference_y_left_z_up_local_lab
+    rigid_body_axes: x_forward_y_left_z_up
+    timestamp_semantics: jetson_ros_callback_time_use_server_time_false
+    extrinsic_status: assumed_coincident_not_measured
+    extrinsic_assumption_id: four_markers_centered_at_fcu_imu_20260722
+
+    mocap_world_from_world_translation_m: [0.0, 0.0, 0.0]
+    mocap_world_from_world_rotation_xyzw: [0.0, 0.0, 0.0, 1.0]
+    base_from_rigid_body_translation_m: [0.0, 0.0, 0.0]
+    base_from_rigid_body_rotation_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+    health:
+      diagnostic_period_sec: 0.1
+      startup_timeout_sec: 10.0
+      stale_after_sec: 0.25
+      minimum_pose_rate_hz: 90.0
+      maximum_stamp_gap_sec: 0.05
+      maximum_receive_gap_sec: 0.05
+      maximum_clock_residual_sec: 0.25
+      maximum_position_norm_m: 20.0
+      maximum_position_step_m: 0.5
+      maximum_rotation_step_rad: 0.7853981633974483
+      pose_rate_window_samples: 120
+      recovery_consecutive_samples: 120

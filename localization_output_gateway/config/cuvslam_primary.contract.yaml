@@ -1,0 +1,52 @@
+# Copyright (c) 2026 u5-4
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+gateway_contract_id: yopo_cuvslam_primary_output_gateway_20260724_v1
+profile: cuvslam_primary
+node:
+  expected_fqn: /localization_output_gateway
+input:
+  topic: /localization/selected/pose
+  type: localization_adapter_interfaces/msg/SelectedPoseCandidate
+  expected_publisher: /localization_source_selector
+  parent_frame: map
+  semantic_child_frame: base_link
+  authorization: selected_pose_candidate_only
+  expected_mode: cuvslam_primary
+  expected_selector_contract_id: yopo_cuvslam_primary_selector_20260724_v1
+  expected_source_contract_id: d435i_fcu_cuvslam_shadow_20260723_v2
+  qos:
+    reliability: reliable
+    durability: volatile
+    history: keep_last
+    depth: 10
+    allow_rmw_unknown_history: true
+diagnostics:
+  topic: /diagnostics
+  type: diagnostic_msgs/msg/DiagnosticArray
+  expected_publisher: /localization_output_gateway
+  authorization: diagnostics_only
+external_vision_output:
+  topic: /mavros/vision_pose/pose_cov
+  type: geometry_msgs/msg/PoseWithCovarianceStamped
+  authorization: explicit_pose_only
+  publisher_creation: required
+  qos:
+    reliability: reliable
+    durability: volatile
+    history: keep_last
+    depth: 10
+    allow_rmw_unknown_history: true
+canonical_odometry:
+  topic: /localization/odometry
+  authorization: deferred
+  publisher_creation: forbidden
+mavros:
+  state_topic: /mavros/state
+  state_type: mavros_msgs/msg/State
+  expected_state_publisher: /mavros/sys
+  timesync_topic: /mavros/timesync_status
+  timesync_type: mavros_msgs/msg/TimesyncStatus
+  expected_timesync_publisher: /mavros/time
+  expected_external_vision_subscriber: /mavros/vision_pose

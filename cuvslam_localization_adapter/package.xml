@@ -16,11 +16,13 @@
   <depend>diagnostic_msgs</depend>
   <depend>eigen</depend>
   <depend>isaac_ros_visual_slam_interfaces</depend>
+  <depend>localization_adapter_interfaces</depend>
   <depend>localization_contracts</depend>
   <depend>nav_msgs</depend>
   <depend>openssl</depend>
   <depend>rcl_interfaces</depend>
   <depend>rclcpp</depend>
+  <depend>rmw</depend>
   <depend>yaml_cpp_vendor</depend>
 
   <exec_depend>ament_index_python</exec_depend>

@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iomanip>
 #include <limits>
 #include <optional>
 #include <set>
@@ -36,6 +37,7 @@
 #include <builtin_interfaces/msg/time.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <diagnostic_msgs/msg/key_value.hpp>
+#include <localization_adapter_interfaces/msg/localization_source_candidate.hpp>
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/message_info.hpp>
 
@@ -63,6 +65,14 @@ using localization_contracts::RigidTransform;
 using localization_contracts::StampOrder;
 
 constexpr std::int64_t kNanosecondsPerSecond = 1000000000LL;
+constexpr char kOdometryMessageType[] = "nav_msgs/msg/Odometry";
+constexpr char kStatusMessageType[] =
+  "isaac_ros_visual_slam_interfaces/msg/VisualSlamStatus";
+constexpr char kCandidateTopic[] = "/localization/candidates/cuvslam/base_pose";
+constexpr char kCandidateMessageType[] =
+  "localization_adapter_interfaces/msg/LocalizationSourceCandidate";
+constexpr char kCandidateAuthorization[] = "source_pose_candidate_only";
+constexpr char kSourceId[] = "cuvslam";
 
 rcl_interfaces::msg::ParameterDescriptor ReadOnlyDescriptor(const std::string & description)
 {
@@ -133,6 +143,29 @@ std::string FullyQualifiedNodeName(const rclcpp::TopicEndpointInfo & endpoint)
          (node_namespace.back() == '/' ? "" : "/") + endpoint.node_name();
 }
 
+template<typename Gid>
+bool GidsEqual(const Gid & left, const Gid & right)
+{
+  return std::equal(left.begin(), left.end(), right.begin());
+}
+
+template<typename Gid>
+bool GidMatchesRmw(const Gid & endpoint_gid, const rmw_gid_t & publisher_gid)
+{
+  return std::equal(endpoint_gid.begin(), endpoint_gid.end(), publisher_gid.data);
+}
+
+template<typename Gid>
+std::string GidToString(const Gid & gid)
+{
+  std::ostringstream stream;
+  stream << std::hex << std::setfill('0');
+  for (const auto byte : gid) {
+    stream << std::setw(2) << static_cast<unsigned int>(byte);
+  }
+  return stream.str();
+}
+
 }  // namespace
 
 CuvslamLocalizationAdapter::CuvslamLocalizationAdapter(const rclcpp::NodeOptions & options)
@@ -170,10 +203,17 @@ CuvslamLocalizationAdapter::CuvslamLocalizationAdapter(const rclcpp::NodeOptions
     rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile();
   diagnostics_publisher_ = create_publisher<DiagnosticArray>(
     contract_.input.diagnostics_topic, diagnostics_qos);
+  source_candidate_publisher_ = create_publisher<
+    localization_adapter_interfaces::msg::LocalizationSourceCandidate>(
+    kCandidateTopic, diagnostics_qos);
   odometry_subscription_ = create_subscription<nav_msgs::msg::Odometry>(
     contract_.input.odometry_topic,
     sensor_qos,
-    std::bind(&CuvslamLocalizationAdapter::OnOdometry, this, std::placeholders::_1));
+    std::bind(
+      &CuvslamLocalizationAdapter::OnOdometry,
+      this,
+      std::placeholders::_1,
+      std::placeholders::_2));
   status_subscription_ = create_subscription<
     isaac_ros_visual_slam_interfaces::msg::VisualSlamStatus>(
     contract_.input.visual_slam_status_topic,
@@ -181,7 +221,8 @@ CuvslamLocalizationAdapter::CuvslamLocalizationAdapter(const rclcpp::NodeOptions
     std::bind(
       &CuvslamLocalizationAdapter::OnVisualSlamStatus,
       this,
-      std::placeholders::_1));
+      std::placeholders::_1,
+      std::placeholders::_2));
   upstream_diagnostics_subscription_ = create_subscription<DiagnosticArray>(
     contract_.input.diagnostics_topic,
     diagnostics_qos,
@@ -194,6 +235,7 @@ CuvslamLocalizationAdapter::CuvslamLocalizationAdapter(const rclcpp::NodeOptions
     contract_.input.diagnostics_topic ||
     std::string(odometry_subscription_->get_topic_name()) !=
     contract_.input.odometry_topic ||
+    std::string(source_candidate_publisher_->get_topic_name()) != kCandidateTopic ||
     std::string(status_subscription_->get_topic_name()) !=
     contract_.input.visual_slam_status_topic ||
     std::string(upstream_diagnostics_subscription_->get_topic_name()) !=
@@ -210,18 +252,36 @@ CuvslamLocalizationAdapter::CuvslamLocalizationAdapter(const rclcpp::NodeOptions
 
   RCLCPP_WARN(
     get_logger(),
-    "Shadow-only localization adapter loaded contract %s (%s); no odometry publisher exists",
+    "Shadow-only localization adapter loaded contract %s (%s); only the unprivileged "
+    "source candidate may be published",
     contract_.contract_id.c_str(), contract_.source_sha256.c_str());
 }
 
 void CuvslamLocalizationAdapter::OnOdometry(
-  const nav_msgs::msg::Odometry::SharedPtr message)
+  const nav_msgs::msg::Odometry::SharedPtr message,
+  const rclcpp::MessageInfo & message_info)
 {
   const SteadyTime now = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(mutex_);
   ++received_;
   last_actual_parent_frame_ = message->header.frame_id;
   last_actual_child_frame_ = message->child_frame_id;
+  if (!ValidateMessagePublisherLocked(
+      message_info,
+      contract_.input.odometry_topic,
+      contract_.input.expected_odometry_publisher,
+      kOdometryMessageType,
+      &bound_odometry_publisher_gid_,
+      &odometry_publisher_count_,
+      &odometry_publisher_identity_valid_,
+      &odometry_publisher_type_valid_,
+      &odometry_publisher_authority_violation_,
+      "ODOMETRY"))
+  {
+    ++rejected_;
+    last_odometry_valid_ = false;
+    return;
+  }
 
   const auto stamp_ns = StampToNanoseconds(message->header.stamp);
   OdometrySample sample{
@@ -395,14 +455,34 @@ void CuvslamLocalizationAdapter::OnOdometry(
     }
   }
   MaybeAdvanceHealthLocked(now);
+  if (health_gate_.State() == HealthState::kHealthy) {
+    PublishSourceCandidateLocked(message->header.stamp);
+  }
 }
 
 void CuvslamLocalizationAdapter::OnVisualSlamStatus(
-  const isaac_ros_visual_slam_interfaces::msg::VisualSlamStatus::SharedPtr message)
+  const isaac_ros_visual_slam_interfaces::msg::VisualSlamStatus::SharedPtr message,
+  const rclcpp::MessageInfo & message_info)
 {
   const SteadyTime now = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(mutex_);
   ++status_received_;
+  if (!ValidateMessagePublisherLocked(
+      message_info,
+      contract_.input.visual_slam_status_topic,
+      contract_.input.expected_status_publisher,
+      kStatusMessageType,
+      &bound_status_publisher_gid_,
+      &status_publisher_count_,
+      &status_publisher_identity_valid_,
+      &status_publisher_type_valid_,
+      &status_publisher_authority_violation_,
+      "TRACKING_STATUS"))
+  {
+    ++status_rejected_;
+    last_status_valid_ = false;
+    return;
+  }
   const auto stamp_ns = StampToNanoseconds(message->header.stamp);
   const bool timing_valid =
     std::isfinite(message->node_callback_execution_time) &&
@@ -610,6 +690,72 @@ void CuvslamLocalizationAdapter::OnUpstreamDiagnostics(
   MaybeAdvanceHealthLocked(now);
 }
 
+bool CuvslamLocalizationAdapter::ValidateMessagePublisherLocked(
+  const rclcpp::MessageInfo & message_info,
+  const std::string & topic,
+  const std::string & expected_publisher,
+  const std::string & expected_type,
+  std::optional<PublisherGid> * bound_gid,
+  std::size_t * publisher_count,
+  bool * publisher_identity_valid,
+  bool * publisher_type_valid,
+  std::uint64_t * authority_violation,
+  const std::string & reason_prefix)
+{
+  if (health_gate_.State() == HealthState::kLatchedFault) {
+    return false;
+  }
+
+  PublisherGid message_gid{};
+  const auto & raw_gid = message_info.get_rmw_message_info().publisher_gid;
+  std::copy_n(raw_gid.data, RMW_GID_STORAGE_SIZE, message_gid.begin());
+  const auto endpoints = get_publishers_info_by_topic(topic);
+  *publisher_count = endpoints.size();
+  *publisher_identity_valid =
+    endpoints.size() == 1U &&
+    FullyQualifiedNodeName(endpoints.front()) == expected_publisher;
+  *publisher_type_valid =
+    endpoints.size() == 1U && endpoints.front().topic_type() == expected_type;
+
+  if (endpoints.size() > 1U) {
+    ++(*authority_violation);
+    health_gate_.MarkLatched(reason_prefix + "_PUBLISHER_NOT_UNIQUE");
+    return false;
+  }
+  if (endpoints.empty()) {
+    if (health_gate_.State() == HealthState::kStarting) {
+      health_gate_.MarkStarting(reason_prefix + "_PUBLISHER_NOT_DISCOVERED");
+    } else {
+      health_gate_.MarkTransient(reason_prefix + "_PUBLISHER_NOT_DISCOVERED");
+    }
+    return false;
+  }
+  if (!*publisher_identity_valid) {
+    ++(*authority_violation);
+    health_gate_.MarkLatched(reason_prefix + "_PUBLISHER_IDENTITY_MISMATCH");
+    return false;
+  }
+  if (!*publisher_type_valid) {
+    ++(*authority_violation);
+    health_gate_.MarkLatched(reason_prefix + "_PUBLISHER_TYPE_MISMATCH");
+    return false;
+  }
+  if (!GidsEqual(endpoints.front().endpoint_gid(), message_gid)) {
+    ++(*authority_violation);
+    health_gate_.MarkLatched(reason_prefix + "_MESSAGE_GID_NOT_DISCOVERED");
+    return false;
+  }
+  if (bound_gid->has_value() && !GidsEqual(bound_gid->value(), message_gid)) {
+    ++(*authority_violation);
+    health_gate_.MarkLatched(reason_prefix + "_PUBLISHER_GID_CHANGED");
+    return false;
+  }
+  if (!bound_gid->has_value()) {
+    *bound_gid = message_gid;
+  }
+  return true;
+}
+
 void CuvslamLocalizationAdapter::UpdatePublisherEvidenceLocked()
 {
   const auto odometry_publishers = get_publishers_info_by_topic(
@@ -619,6 +765,18 @@ void CuvslamLocalizationAdapter::UpdatePublisherEvidenceLocked()
     odometry_publishers.size() == 1U &&
     FullyQualifiedNodeName(odometry_publishers.front()) ==
     contract_.input.expected_odometry_publisher;
+  odometry_publisher_type_valid_ =
+    odometry_publishers.size() == 1U &&
+    odometry_publishers.front().topic_type() == kOdometryMessageType;
+  if (health_gate_.State() != HealthState::kLatchedFault &&
+    bound_odometry_publisher_gid_.has_value() && odometry_publishers.size() == 1U &&
+    !GidsEqual(
+      bound_odometry_publisher_gid_.value(),
+      odometry_publishers.front().endpoint_gid()))
+  {
+    ++odometry_publisher_authority_violation_;
+    health_gate_.MarkLatched("ODOMETRY_PUBLISHER_GID_CHANGED");
+  }
 
   const auto status_publishers = get_publishers_info_by_topic(
     contract_.input.visual_slam_status_topic);
@@ -627,6 +785,49 @@ void CuvslamLocalizationAdapter::UpdatePublisherEvidenceLocked()
     status_publishers.size() == 1U &&
     FullyQualifiedNodeName(status_publishers.front()) ==
     contract_.input.expected_status_publisher;
+  status_publisher_type_valid_ =
+    status_publishers.size() == 1U &&
+    status_publishers.front().topic_type() == kStatusMessageType;
+  if (health_gate_.State() != HealthState::kLatchedFault &&
+    bound_status_publisher_gid_.has_value() && status_publishers.size() == 1U &&
+    !GidsEqual(
+      bound_status_publisher_gid_.value(),
+      status_publishers.front().endpoint_gid()))
+  {
+    ++status_publisher_authority_violation_;
+    health_gate_.MarkLatched("TRACKING_STATUS_PUBLISHER_GID_CHANGED");
+  }
+}
+
+void CuvslamLocalizationAdapter::UpdateCandidatePublisherEvidenceLocked()
+{
+  const auto endpoints = get_publishers_info_by_topic(kCandidateTopic);
+  candidate_publisher_count_ = endpoints.size();
+  candidate_publisher_identity_valid_ =
+    endpoints.size() == 1U &&
+    FullyQualifiedNodeName(endpoints.front()) == get_fully_qualified_name();
+  candidate_publisher_type_valid_ =
+    endpoints.size() == 1U && endpoints.front().topic_type() == kCandidateMessageType;
+  candidate_publisher_gid_valid_ =
+    endpoints.size() == 1U &&
+    GidMatchesRmw(endpoints.front().endpoint_gid(), source_candidate_publisher_->get_gid());
+}
+
+bool CuvslamLocalizationAdapter::CandidatePublisherIsAuthoritativeLocked()
+{
+  UpdateCandidatePublisherEvidenceLocked();
+  if (candidate_publisher_count_ == 1U && candidate_publisher_identity_valid_ &&
+    candidate_publisher_type_valid_ && candidate_publisher_gid_valid_)
+  {
+    return true;
+  }
+
+  ++candidate_publisher_authority_violation_;
+  health_gate_.MarkLatched(
+    candidate_publisher_count_ > 1U ?
+    "SOURCE_CANDIDATE_PUBLISHER_NOT_UNIQUE" :
+    "SOURCE_CANDIDATE_PUBLISHER_AUTHORITY_INVALID");
+  return false;
 }
 
 void CuvslamLocalizationAdapter::UpdateOdometryRateLocked(const std::int64_t stamp_ns)
@@ -675,16 +876,38 @@ bool CuvslamLocalizationAdapter::InputsAreHealthyLocked(
     *reason = "WAITING_FOR_ODOMETRY_PUBLISHER";
     return false;
   }
-  if (odometry_publisher_count_ != 1U || !odometry_publisher_identity_valid_) {
+  if (odometry_publisher_count_ != 1U || !odometry_publisher_identity_valid_ ||
+    !odometry_publisher_type_valid_)
+  {
     *reason = "ODOMETRY_PUBLISHER_AUTHORITY_INVALID";
+    return false;
+  }
+  if (!bound_odometry_publisher_gid_.has_value()) {
+    *reason = "WAITING_FOR_ODOMETRY_PUBLISHER_GID";
     return false;
   }
   if (status_publisher_count_ == 0U) {
     *reason = "WAITING_FOR_TRACKING_STATUS_PUBLISHER";
     return false;
   }
-  if (status_publisher_count_ != 1U || !status_publisher_identity_valid_) {
+  if (status_publisher_count_ != 1U || !status_publisher_identity_valid_ ||
+    !status_publisher_type_valid_)
+  {
     *reason = "TRACKING_STATUS_PUBLISHER_AUTHORITY_INVALID";
+    return false;
+  }
+  if (!bound_status_publisher_gid_.has_value()) {
+    *reason = "WAITING_FOR_TRACKING_STATUS_PUBLISHER_GID";
+    return false;
+  }
+  if (candidate_publisher_count_ == 0U) {
+    *reason = "WAITING_FOR_SOURCE_CANDIDATE_PUBLISHER";
+    return false;
+  }
+  if (candidate_publisher_count_ != 1U || !candidate_publisher_identity_valid_ ||
+    !candidate_publisher_type_valid_ || !candidate_publisher_gid_valid_)
+  {
+    *reason = "SOURCE_CANDIDATE_PUBLISHER_AUTHORITY_INVALID";
     return false;
   }
   if (!last_odometry_received_at_.has_value()) {
@@ -810,14 +1033,37 @@ void CuvslamLocalizationAdapter::OnDiagnosticTimer()
   const SteadyTime now = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(mutex_);
   UpdatePublisherEvidenceLocked();
-  if (odometry_publisher_count_ > 1U) {
-    health_gate_.MarkLatched("ODOMETRY_PUBLISHER_NOT_UNIQUE");
-  } else if (odometry_publisher_count_ == 1U && !odometry_publisher_identity_valid_) {
-    health_gate_.MarkLatched("ODOMETRY_PUBLISHER_IDENTITY_MISMATCH");
-  } else if (status_publisher_count_ > 1U) {
-    health_gate_.MarkLatched("TRACKING_STATUS_PUBLISHER_NOT_UNIQUE");
-  } else if (status_publisher_count_ == 1U && !status_publisher_identity_valid_) {
-    health_gate_.MarkLatched("TRACKING_STATUS_PUBLISHER_IDENTITY_MISMATCH");
+  UpdateCandidatePublisherEvidenceLocked();
+  const bool candidate_publisher_authority_invalid =
+    candidate_publisher_count_ == 1U &&
+    (!candidate_publisher_identity_valid_ || !candidate_publisher_type_valid_ ||
+    !candidate_publisher_gid_valid_);
+  if (health_gate_.State() != HealthState::kLatchedFault) {
+    if (odometry_publisher_count_ > 1U) {
+      ++odometry_publisher_authority_violation_;
+      health_gate_.MarkLatched("ODOMETRY_PUBLISHER_NOT_UNIQUE");
+    } else if (odometry_publisher_count_ == 1U && !odometry_publisher_identity_valid_) {
+      ++odometry_publisher_authority_violation_;
+      health_gate_.MarkLatched("ODOMETRY_PUBLISHER_IDENTITY_MISMATCH");
+    } else if (odometry_publisher_count_ == 1U && !odometry_publisher_type_valid_) {
+      ++odometry_publisher_authority_violation_;
+      health_gate_.MarkLatched("ODOMETRY_PUBLISHER_TYPE_MISMATCH");
+    } else if (status_publisher_count_ > 1U) {
+      ++status_publisher_authority_violation_;
+      health_gate_.MarkLatched("TRACKING_STATUS_PUBLISHER_NOT_UNIQUE");
+    } else if (status_publisher_count_ == 1U && !status_publisher_identity_valid_) {
+      ++status_publisher_authority_violation_;
+      health_gate_.MarkLatched("TRACKING_STATUS_PUBLISHER_IDENTITY_MISMATCH");
+    } else if (status_publisher_count_ == 1U && !status_publisher_type_valid_) {
+      ++status_publisher_authority_violation_;
+      health_gate_.MarkLatched("TRACKING_STATUS_PUBLISHER_TYPE_MISMATCH");
+    } else if (candidate_publisher_count_ > 1U) {
+      ++candidate_publisher_authority_violation_;
+      health_gate_.MarkLatched("SOURCE_CANDIDATE_PUBLISHER_NOT_UNIQUE");
+    } else if (candidate_publisher_authority_invalid) {
+      ++candidate_publisher_authority_violation_;
+      health_gate_.MarkLatched("SOURCE_CANDIDATE_PUBLISHER_AUTHORITY_INVALID");
+    }
   }
   if (health_gate_.State() != HealthState::kLatchedFault) {
     std::string reason;
@@ -838,6 +1084,37 @@ void CuvslamLocalizationAdapter::OnDiagnosticTimer()
     }
   }
   PublishDiagnosticsLocked(now);
+}
+
+void CuvslamLocalizationAdapter::PublishSourceCandidateLocked(
+  const builtin_interfaces::msg::Time & stamp)
+{
+  if (!CandidatePublisherIsAuthoritativeLocked()) {
+    return;
+  }
+  if (!last_shadow_pose_.has_value()) {
+    health_gate_.MarkLatched("SOURCE_CANDIDATE_POSE_MISSING");
+    return;
+  }
+
+  localization_adapter_interfaces::msg::LocalizationSourceCandidate output;
+  output.header.stamp = stamp;
+  output.header.frame_id = contract_.output_parent_frame;
+  output.semantic_child_frame = contract_.output_child_frame;
+  const Eigen::Vector3d & translation = last_shadow_pose_->Translation();
+  output.pose.position.x = translation.x();
+  output.pose.position.y = translation.y();
+  output.pose.position.z = translation.z();
+  const QuaternionXyzw rotation = last_shadow_pose_->RotationXyzw();
+  output.pose.orientation.x = rotation.x;
+  output.pose.orientation.y = rotation.y;
+  output.pose.orientation.z = rotation.z;
+  output.pose.orientation.w = rotation.w;
+  output.source_id = kSourceId;
+  output.source_contract_id = contract_.contract_id;
+  output.authorization = kCandidateAuthorization;
+  source_candidate_publisher_->publish(output);
+  ++source_candidates_published_;
 }
 
 void CuvslamLocalizationAdapter::PublishDiagnosticsLocked(const SteadyTime & now)
@@ -895,6 +1172,25 @@ void CuvslamLocalizationAdapter::PublishDiagnosticsLocked(const SteadyTime & now
     Value("status_publisher_count", status_publisher_count_),
     Value("odometry_publisher_identity_valid", odometry_publisher_identity_valid_),
     Value("status_publisher_identity_valid", status_publisher_identity_valid_),
+    Value("odometry_publisher_type_valid", odometry_publisher_type_valid_),
+    Value("status_publisher_type_valid", status_publisher_type_valid_),
+    Value(
+      "bound_odometry_publisher_gid",
+      bound_odometry_publisher_gid_.has_value() ?
+      GidToString(bound_odometry_publisher_gid_.value()) : "unbound"),
+    Value(
+      "bound_status_publisher_gid",
+      bound_status_publisher_gid_.has_value() ?
+      GidToString(bound_status_publisher_gid_.value()) : "unbound"),
+    Value("source_candidate_topic", kCandidateTopic),
+    Value("source_candidate_type", kCandidateMessageType),
+    Value("source_candidate_authorization", kCandidateAuthorization),
+    Value("source_candidate_publisher_count", candidate_publisher_count_),
+    Value(
+      "source_candidate_publisher_identity_valid",
+      candidate_publisher_identity_valid_),
+    Value("source_candidate_publisher_type_valid", candidate_publisher_type_valid_),
+    Value("source_candidate_publisher_gid_valid", candidate_publisher_gid_valid_),
     Value("last_vo_state", static_cast<unsigned int>(last_vo_state_)),
     Value("received", received_),
     Value("accepted", accepted_),
@@ -919,6 +1215,16 @@ void CuvslamLocalizationAdapter::PublishDiagnosticsLocked(const SteadyTime & now
       "large_pose_step_heuristic; explicit epoch signal unavailable"),
     Value("shadow_processed", shadow_processed_),
     Value("shadow_pose_computed", shadow_pose_computed_),
+    Value("published_source_candidates", source_candidates_published_),
+    Value(
+      "odometry_publisher_authority_violation",
+      odometry_publisher_authority_violation_),
+    Value(
+      "status_publisher_authority_violation",
+      status_publisher_authority_violation_),
+    Value(
+      "source_candidate_publisher_authority_violation",
+      candidate_publisher_authority_violation_),
     Value("published", kPublished),
     Value("recovery_progress", health_gate_.RecoveryProgress()),
     Value("recovery_required", health_gate_.RecoveryRequired()),

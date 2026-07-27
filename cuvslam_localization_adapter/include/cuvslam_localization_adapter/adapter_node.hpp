@@ -15,6 +15,9 @@
 #ifndef CUVSLAM_LOCALIZATION_ADAPTER__ADAPTER_NODE_HPP_
 #define CUVSLAM_LOCALIZATION_ADAPTER__ADAPTER_NODE_HPP_
 
+#include <rmw/types.h>
+
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -25,8 +28,10 @@
 #include <string>
 #include <unordered_map>
 
+#include <builtin_interfaces/msg/time.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <isaac_ros_visual_slam_interfaces/msg/visual_slam_status.hpp>
+#include <localization_adapter_interfaces/msg/localization_source_candidate.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 
@@ -45,6 +50,7 @@ public:
 
 private:
   using SteadyTime = std::chrono::steady_clock::time_point;
+  using PublisherGid = std::array<std::uint8_t, RMW_GID_STORAGE_SIZE>;
 
   struct UpstreamDiagnosticObservation
   {
@@ -53,19 +59,36 @@ private:
     SteadyTime received_at;
   };
 
-  void OnOdometry(const nav_msgs::msg::Odometry::SharedPtr message);
+  void OnOdometry(
+    const nav_msgs::msg::Odometry::SharedPtr message,
+    const rclcpp::MessageInfo & message_info);
   void OnVisualSlamStatus(
-    const isaac_ros_visual_slam_interfaces::msg::VisualSlamStatus::SharedPtr message);
+    const isaac_ros_visual_slam_interfaces::msg::VisualSlamStatus::SharedPtr message,
+    const rclcpp::MessageInfo & message_info);
   void OnUpstreamDiagnostics(
     const diagnostic_msgs::msg::DiagnosticArray::SharedPtr message,
     const rclcpp::MessageInfo & message_info);
   void OnDiagnosticTimer();
 
   bool InputsAreHealthyLocked(const SteadyTime & now, std::string * reason) const;
+  bool ValidateMessagePublisherLocked(
+    const rclcpp::MessageInfo & message_info,
+    const std::string & topic,
+    const std::string & expected_publisher,
+    const std::string & expected_type,
+    std::optional<PublisherGid> * bound_gid,
+    std::size_t * publisher_count,
+    bool * publisher_identity_valid,
+    bool * publisher_type_valid,
+    std::uint64_t * authority_violation,
+    const std::string & reason_prefix);
   void UpdatePublisherEvidenceLocked();
+  void UpdateCandidatePublisherEvidenceLocked();
+  bool CandidatePublisherIsAuthoritativeLocked();
   void UpdateOdometryRateLocked(std::int64_t stamp_ns);
   bool ClockDomainMatches(std::int64_t stamp_ns, double * residual_sec);
   void MaybeAdvanceHealthLocked(const SteadyTime & now);
+  void PublishSourceCandidateLocked(const builtin_interfaces::msg::Time & stamp);
   void PublishDiagnosticsLocked(const SteadyTime & now);
   std::optional<double> AgeSeconds(
     const std::optional<SteadyTime> & received_at,
@@ -108,6 +131,14 @@ private:
   std::size_t status_publisher_count_{0U};
   bool odometry_publisher_identity_valid_{false};
   bool status_publisher_identity_valid_{false};
+  bool odometry_publisher_type_valid_{false};
+  bool status_publisher_type_valid_{false};
+  std::optional<PublisherGid> bound_odometry_publisher_gid_;
+  std::optional<PublisherGid> bound_status_publisher_gid_;
+  std::size_t candidate_publisher_count_{0U};
+  bool candidate_publisher_identity_valid_{false};
+  bool candidate_publisher_type_valid_{false};
+  bool candidate_publisher_gid_valid_{false};
 
   std::uint64_t received_{0U};
   std::uint64_t accepted_{0U};
@@ -129,10 +160,17 @@ private:
   std::uint64_t pose_jump_violation_{0U};
   std::uint64_t shadow_processed_{0U};
   std::uint64_t shadow_pose_computed_{0U};
+  std::uint64_t source_candidates_published_{0U};
+  std::uint64_t odometry_publisher_authority_violation_{0U};
+  std::uint64_t status_publisher_authority_violation_{0U};
+  std::uint64_t candidate_publisher_authority_violation_{0U};
   static constexpr std::uint64_t kPublished = 0U;
 
   mutable std::mutex mutex_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_publisher_;
+  rclcpp::Publisher<
+    localization_adapter_interfaces::msg::LocalizationSourceCandidate>::SharedPtr
+    source_candidate_publisher_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_subscription_;
   rclcpp::Subscription<
     isaac_ros_visual_slam_interfaces::msg::VisualSlamStatus>::SharedPtr status_subscription_;

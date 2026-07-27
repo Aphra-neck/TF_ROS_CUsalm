@@ -30,11 +30,13 @@ find_package(diagnostic_msgs REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(isaac_ros_visual_slam_interfaces REQUIRED)
+find_package(localization_adapter_interfaces REQUIRED)
 find_package(localization_contracts REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rmw REQUIRED)
 find_package(yaml_cpp_vendor REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
@@ -50,10 +52,12 @@ ament_target_dependencies(${PROJECT_NAME}_core
   builtin_interfaces
   diagnostic_msgs
   isaac_ros_visual_slam_interfaces
+  localization_adapter_interfaces
   localization_contracts
   nav_msgs
   rcl_interfaces
   rclcpp
+  rmw
   yaml_cpp_vendor
 )
 target_link_libraries(${PROJECT_NAME}_core OpenSSL::Crypto yaml-cpp Eigen3::Eigen)
@@ -80,6 +84,7 @@ if(BUILD_TESTING)
   if(TARGET test_contract_config)
     target_link_libraries(test_contract_config ${PROJECT_NAME}_core)
     target_compile_definitions(test_contract_config PRIVATE
+      TEST_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/config"
       TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
   endif()
 
@@ -89,6 +94,45 @@ if(BUILD_TESTING)
     ament_target_dependencies(test_shadow_node_contract rclcpp)
     target_compile_definitions(test_shadow_node_contract PRIVATE
       TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
+  endif()
+
+  ament_add_gtest(test_live_source_candidate test/test_live_source_candidate.cpp)
+  if(TARGET test_live_source_candidate)
+    target_link_libraries(test_live_source_candidate ${PROJECT_NAME}_core)
+    ament_target_dependencies(test_live_source_candidate
+      diagnostic_msgs
+      isaac_ros_visual_slam_interfaces
+      localization_adapter_interfaces
+      nav_msgs
+      rclcpp
+    )
+    target_compile_definitions(test_live_source_candidate PRIVATE
+      TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
+    set_tests_properties(test_live_source_candidate PROPERTIES
+      ENVIRONMENT "ROS_DOMAIN_ID=223;ROS_LOCALHOST_ONLY=1"
+      TIMEOUT 20
+    )
+  endif()
+
+  ament_add_gtest(
+    test_input_publisher_authority
+    test/test_input_publisher_authority.cpp
+  )
+  if(TARGET test_input_publisher_authority)
+    target_link_libraries(test_input_publisher_authority ${PROJECT_NAME}_core)
+    ament_target_dependencies(test_input_publisher_authority
+      diagnostic_msgs
+      isaac_ros_visual_slam_interfaces
+      localization_adapter_interfaces
+      nav_msgs
+      rclcpp
+    )
+    target_compile_definitions(test_input_publisher_authority PRIVATE
+      TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
+    set_tests_properties(test_input_publisher_authority PROPERTIES
+      ENVIRONMENT "ROS_DOMAIN_ID=224;ROS_LOCALHOST_ONLY=1"
+      TIMEOUT 30
+    )
   endif()
 endif()
 

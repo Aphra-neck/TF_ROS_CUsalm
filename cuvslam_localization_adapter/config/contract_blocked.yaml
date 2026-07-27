@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 schema_version: 1
-contract_id: d435i_fcu_cuvslam_shadow_20260722
+contract_id: d435i_fcu_cuvslam_shadow_20260723_v2
 status: blocked
 input:
   odometry_topic: /visual_slam/tracking/odometry
@@ -62,13 +62,13 @@ health:
   maximum_rotation_step_deg: 45.0
   odometry_rate_window_samples: 30
 extrinsic:
-  status: blocked
+  status: approved
   parent_frame: base_link
   child_frame: camera_link
-  translation_m: null
-  rotation_xyzw: null
-  provenance: null
-  reason: "T[base_link,fcu_imu] has not been measured or approved"
+  translation_m: [0.05, 0.0, 0.0]
+  rotation_xyzw: [0.0, 0.0, 0.0, 1.0]
+  provenance: airframe_measurement/user_confirmed_20260723_camera_50mm_forward
+  reason: "camera_link is 50 mm forward of coincident base_link/fcu_imu; all axes are aligned"
 twist:
   status: blocked
   policy: reject

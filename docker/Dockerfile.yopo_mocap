@@ -1,0 +1,12 @@
+ARG BASE_IMAGE=ubuntu:22.04
+FROM ${BASE_IMAGE}
+
+# The gateway runs in the Isaac ROS container while MAVROS runs on the host.
+# Install the ROS interfaces and C++ type support needed across that boundary.
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ros-humble-mavros-msgs \
+    && test -f /opt/ros/humble/share/mavros_msgs/package.xml \
+    && test -f /opt/ros/humble/lib/libmavros_msgs__rosidl_typesupport_cpp.so \
+    && rm -rf /var/lib/apt/lists/*

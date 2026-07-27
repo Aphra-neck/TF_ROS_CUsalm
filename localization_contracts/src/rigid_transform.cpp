@@ -200,9 +200,9 @@ bool RigidTransform::IsEquivalent(
   if ((translation_ - other.translation_).norm() > translation_tolerance) {
     return false;
   }
-  const double dot = std::abs(rotation_.dot(other.rotation_));
-  const double angular_distance =
-    2.0 * std::acos(std::clamp(dot, 0.0, 1.0));
+  const Eigen::Quaterniond relative_rotation = rotation_.conjugate() * other.rotation_;
+  const double angular_distance = 2.0 * std::atan2(
+    relative_rotation.vec().norm(), std::abs(relative_rotation.w()));
   return angular_distance <= angular_tolerance_rad;
 }
 

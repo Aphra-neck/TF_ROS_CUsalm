@@ -48,7 +48,7 @@ protected:
   }
 };
 
-TEST_F(ShadowNodeContract, DefaultGraphHasNoStateTfOrControlPublishers)
+TEST_F(ShadowNodeContract, DefaultGraphHasOnlyUnprivilegedSourceCandidateOutput)
 {
   const std::string contract =
     std::string(TEST_FIXTURE_DIR) + "/../../config/contract_blocked.yaml";
@@ -62,10 +62,17 @@ TEST_F(ShadowNodeContract, DefaultGraphHasNoStateTfOrControlPublishers)
 
   const auto publishers = node->get_node_graph_interface()
     ->get_publisher_names_and_types_by_node(node->get_name(), node->get_namespace());
+  const auto candidate = publishers.find("/localization/candidates/cuvslam/base_pose");
+  ASSERT_NE(candidate, publishers.end());
+  ASSERT_EQ(candidate->second.size(), 1U);
+  EXPECT_EQ(
+    candidate->second.front(),
+    "localization_adapter_interfaces/msg/LocalizationSourceCandidate");
   EXPECT_EQ(publishers.count("/localization/odometry"), 0U);
   EXPECT_EQ(publishers.count("/state/odom"), 0U);
   EXPECT_EQ(publishers.count("/localization/mavros_candidate"), 0U);
   EXPECT_EQ(publishers.count("/mavros/odometry/out"), 0U);
+  EXPECT_EQ(publishers.count("/mavros/vision_pose/pose_cov"), 0U);
   EXPECT_EQ(publishers.count("/tf"), 0U);
   EXPECT_EQ(publishers.count("/tf_static"), 0U);
   EXPECT_EQ(publishers.count("/diagnostics"), 1U);
@@ -86,7 +93,7 @@ TEST_F(ShadowNodeContract, RejectsAnyNonShadowRuntimeMode)
     std::runtime_error);
 }
 
-TEST_F(ShadowNodeContract, ApprovedSyntheticExtrinsicStillCreatesNoStatePublisher)
+TEST_F(ShadowNodeContract, ApprovedSyntheticExtrinsicStillCreatesNoPrivilegedPublisher)
 {
   const std::string contract =
     std::string(TEST_FIXTURE_DIR) + "/approved_synthetic_contract.yaml";
@@ -100,6 +107,7 @@ TEST_F(ShadowNodeContract, ApprovedSyntheticExtrinsicStillCreatesNoStatePublishe
 
   const auto publishers = node->get_node_graph_interface()
     ->get_publisher_names_and_types_by_node(node->get_name(), node->get_namespace());
+  EXPECT_EQ(publishers.count("/localization/candidates/cuvslam/base_pose"), 1U);
   EXPECT_EQ(publishers.count("/localization/odometry"), 0U);
   EXPECT_EQ(publishers.count("/diagnostics"), 1U);
 }
@@ -138,6 +146,22 @@ TEST_F(ShadowNodeContract, RejectsRemappingOfContractBoundTopics)
       });
   EXPECT_THROW(
     std::make_shared<CuvslamLocalizationAdapter>(diagnostics_options),
+    std::runtime_error);
+
+  rclcpp::NodeOptions candidate_options;
+  candidate_options.arguments(
+      {
+        "--ros-args",
+        "--remap",
+        "/localization/candidates/cuvslam/base_pose:=/mavros/vision_pose/pose_cov",
+      });
+  candidate_options.parameter_overrides(
+      {
+        rclcpp::Parameter("mode", "shadow"),
+        rclcpp::Parameter("contract_file", contract),
+      });
+  EXPECT_THROW(
+    std::make_shared<CuvslamLocalizationAdapter>(candidate_options),
     std::runtime_error);
 }
 
