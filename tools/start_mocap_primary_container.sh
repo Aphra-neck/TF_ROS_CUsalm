@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Container-only supervisor for the mocap-primary localization path.
+# Container-only supervisor for D435 depth and the mocap-primary localization path.
 # MAVROS must already be running on the Jetson host. This script never arms,
 # changes PX4 mode, starts YOPO, or publishes control commands.
 # It keeps all container-side launch processes under one foreground terminal.
@@ -15,10 +15,13 @@ readonly STARTUP_TIMEOUT_SEC="${STARTUP_TIMEOUT_SEC:-30}"
 readonly PROBE_TIMEOUT_SEC="${PROBE_TIMEOUT_SEC:-3}"
 readonly SHUTDOWN_TIMEOUT_SEC="${SHUTDOWN_TIMEOUT_SEC:-8}"
 readonly LOCK_FILE="${MOCAP_PRIMARY_LOCK_FILE:-/tmp/yopo_mocap_primary_container.lock}"
+readonly D435_SERIAL="${D435_SERIAL-243622070369}"
+readonly YOPO_DEPTH_TOPIC="${YOPO_DEPTH_TOPIC:-/depth_image}"
 
 declare -a child_names=()
 declare -a child_pids=()
 declare -a child_logs=()
+declare -a child_exit_reported=()
 tail_pid=""
 lock_fd=""
 shutdown_started=0
@@ -33,8 +36,9 @@ usage()
 Usage: bash tools/${SCRIPT_NAME}
 
 Run this once inside the Isaac ROS container after MAVROS is connected on the
-Jetson host. Keep this terminal open; press Ctrl-C to stop the container-side
-chain in reverse order.
+Jetson host. It starts one depth-only D435 node plus the mocap-primary
+localization chain. Keep this terminal open; press Ctrl-C to stop the
+container-side chain in reverse order.
 EOF
 }
 
@@ -60,7 +64,9 @@ validate_positive_integer()
 
 process_group_is_alive()
 {
-  kill -0 -- "-$1" 2>/dev/null
+  local pid="${1:-}"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -0 -- "-$pid" 2>/dev/null
 }
 
 shutdown_children()
@@ -136,7 +142,9 @@ shutdown_children()
     fi
   done
   for index in "${!child_pids[@]}"; do
-    wait "${child_pids[$index]}" 2>/dev/null || true
+    if [ -n "${child_pids[$index]}" ]; then
+      wait "${child_pids[$index]}" 2>/dev/null || true
+    fi
   done
   for index in "${!child_pids[@]}"; do
     if process_group_is_alive "${child_pids[$index]}"; then
@@ -276,6 +284,7 @@ preflight_packages()
 {
   local package
   for package in \
+    realsense2_camera \
     vrpn_client_ros \
     mocap_localization_adapter \
     localization_source_selector \
@@ -334,6 +343,11 @@ assert_no_existing_runtime()
     stop "unable to inspect the ROS topic graph"
 
   for node in \
+    /camera/camera \
+    /aligned_fcu_imu_relay \
+    /d435i_cuvslam_runtime_health_monitor \
+    /visual_slam_launch_container \
+    /visual_slam_node \
     /vrpn_client_node \
     /mocap_localization_adapter \
     /localization_source_selector \
@@ -345,6 +359,7 @@ assert_no_existing_runtime()
   done
 
   for topic in \
+    "$YOPO_DEPTH_TOPIC" \
     /droneyee207/pose \
     /localization/candidates/mocap/base_pose \
     /localization/selected/pose \
@@ -372,6 +387,83 @@ capture_one()
   local topic="$1"
   local type="$2"
   bounded ros2 topic echo "$topic" "$type" --once --no-arr 2>/dev/null
+}
+
+depth_message_is_valid()
+{
+  local output="$1"
+  local height
+  local width
+  local encoding
+  local frame_id
+  local step
+
+  height="$(printf '%s\n' "$output" | awk '/^height:/ {print $2; exit}')"
+  width="$(printf '%s\n' "$output" | awk '/^width:/ {print $2; exit}')"
+  encoding="$(printf '%s\n' "$output" | awk '/^encoding:/ {print $2; exit}')"
+  frame_id="$(printf '%s\n' "$output" |
+    awk '$1 == "frame_id:" {print $2; exit}')"
+  step="$(printf '%s\n' "$output" | awk '/^step:/ {print $2; exit}')"
+  [ "$height" = "360" ] &&
+    [ "$width" = "640" ] &&
+    [ "$encoding" = "16UC1" ] &&
+    [ "$frame_id" = "camera_depth_optical_frame" ] &&
+    [ "$step" = "1280" ]
+}
+
+camera_parameters_are_valid()
+{
+  local value
+
+  value="$(bounded ros2 param get /camera/camera enable_depth 2>/dev/null)" || return 1
+  [ "$value" = "Boolean value is: True" ] || return 1
+  value="$(bounded ros2 param get /camera/camera enable_color 2>/dev/null)" || return 1
+  [ "$value" = "Boolean value is: False" ] || return 1
+  value="$(bounded ros2 param get /camera/camera enable_infra1 2>/dev/null)" || return 1
+  [ "$value" = "Boolean value is: False" ] || return 1
+  value="$(bounded ros2 param get /camera/camera enable_infra2 2>/dev/null)" || return 1
+  [ "$value" = "Boolean value is: False" ] || return 1
+  value="$(bounded ros2 param get /camera/camera enable_gyro 2>/dev/null)" || return 1
+  [ "$value" = "Boolean value is: False" ] || return 1
+  value="$(bounded ros2 param get /camera/camera enable_accel 2>/dev/null)" || return 1
+  [ "$value" = "Boolean value is: False" ] || return 1
+  value="$(bounded ros2 param get \
+    /camera/camera depth_module.emitter_enabled 2>/dev/null)" || return 1
+  [ "$value" = "Integer value is: 0" ] || return 1
+  value="$(bounded ros2 param get \
+    /camera/camera depth_module.profile 2>/dev/null)" || return 1
+  [ "$value" = "String value is: 640x360x90" ]
+}
+
+wait_for_depth_ready()
+{
+  local child_index="$1"
+  local deadline=$((SECONDS + STARTUP_TIMEOUT_SEC))
+  local message
+  local endpoint
+
+  log "Waiting for D435 depth: ${YOPO_DEPTH_TOPIC}"
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    ensure_child_alive \
+      "${child_pids[$child_index]}" \
+      "${child_names[$child_index]}" \
+      "${child_logs[$child_index]}"
+    endpoint="$(bounded ros2 topic info -v "$YOPO_DEPTH_TOPIC" 2>/dev/null || true)"
+    message="$(capture_one "$YOPO_DEPTH_TOPIC" sensor_msgs/msg/Image || true)"
+    if [ "$(topic_count_from_info "$endpoint" Publisher)" = "1" ] &&
+      endpoint_exists_in_info \
+        "$endpoint" camera /camera sensor_msgs/msg/Image PUBLISHER &&
+      depth_message_is_valid "$message" &&
+      camera_parameters_are_valid
+    then
+      log "D435 depth is ready (640x360, 16UC1, emitter disabled)"
+      return
+    fi
+    sleep 1
+  done
+  show_child_log \
+    "${child_names[$child_index]}" "${child_logs[$child_index]}"
+  stop "D435 depth did not satisfy the runtime contract within ${STARTUP_TIMEOUT_SEC}s"
 }
 
 wait_for_mavros_graph()
@@ -516,6 +608,7 @@ start_launch()
   child_names+=("$name")
   child_pids+=("$pid")
   child_logs+=("$log_file")
+  child_exit_reported+=(0)
   trap 'on_signal SIGINT' INT
   trap 'on_signal SIGTERM' TERM
   trap 'on_signal SIGHUP' HUP
@@ -637,11 +730,14 @@ runtime_health_check()
   local adapter_output
   local selector_output
   local gateway_output
+  local depth_endpoint
+  local depth_message
   local endpoint_output
   local published
 
   node_list="$(bounded ros2 node list 2>/dev/null)" || return 1
   for node in \
+    /camera/camera \
     /vrpn_client_node \
     /mocap_localization_adapter \
     /localization_source_selector \
@@ -649,6 +745,26 @@ runtime_health_check()
   do
     [ "$(printf '%s\n' "$node_list" | grep -Fxc "$node")" = "1" ] || return 1
   done
+
+  for node in \
+    /aligned_fcu_imu_relay \
+    /d435i_cuvslam_runtime_health_monitor \
+    /visual_slam_launch_container \
+    /visual_slam_node
+  do
+    if printf '%s\n' "$node_list" | grep -Fxq "$node"; then
+      return 1
+    fi
+  done
+
+  depth_endpoint="$(bounded ros2 topic info -v \
+    "$YOPO_DEPTH_TOPIC" 2>/dev/null)" || return 1
+  [ "$(topic_count_from_info "$depth_endpoint" Publisher)" = "1" ] || return 1
+  endpoint_exists_in_info \
+    "$depth_endpoint" camera /camera sensor_msgs/msg/Image PUBLISHER || return 1
+  depth_message="$(capture_one \
+    "$YOPO_DEPTH_TOPIC" sensor_msgs/msg/Image)" || return 1
+  depth_message_is_valid "$depth_message" || return 1
 
   adapter_output="$(capture_diagnostic mocap_localization_adapter)" || return 1
   selector_output="$(capture_diagnostic localization_source_selector)" || return 1
@@ -717,9 +833,9 @@ monitor_children()
 
   set +e
 
-  log "All container-side nodes are ready"
+  log "D435 depth and all container-side localization nodes are ready"
   log "Logs: ${LOG_DIR}"
-  log "This confirms localization transport, not PX4 EKF fusion or flight readiness"
+  log "This confirms depth and localization transport, not YOPO or flight readiness"
   log "The deferred 60-second timesync RTT/jitter acceptance test is not performed"
   log "Keep this terminal open; press Ctrl-C only after PX4 is disarmed"
   setsid tail -n 0 -F "${child_logs[@]}" &
@@ -727,7 +843,24 @@ monitor_children()
 
   while true; do
     for index in "${!child_pids[@]}"; do
+      if [ -z "${child_pids[$index]}" ]; then
+        continue
+      fi
       if ! kill -0 "${child_pids[$index]}" 2>/dev/null; then
+        if [ "${child_names[$index]}" = "d435_depth" ] &&
+          [ "$external_vision_active" -eq 1 ]
+        then
+          if [ "${child_exit_reported[$index]}" -eq 0 ]; then
+            child_exit_reported[$index]=1
+            wait "${child_pids[$index]}"
+            exit_code=$?
+            child_pids[$index]=""
+            show_child_log "${child_names[$index]}" "${child_logs[$index]}"
+            log "FAULT: D435 depth exited with code ${exit_code};" \
+              "localization remains running" >&2
+          fi
+          continue
+        fi
         if wait "${child_pids[$index]}"; then
           exit_code=0
         else
@@ -758,6 +891,11 @@ monitor_children()
 
 main()
 {
+  local camera_index
+  local vrpn_index
+  local adapter_index
+  local gateway_index
+
   if [ "$#" -gt 0 ]; then
     case "$1" in
       -h|--help)
@@ -774,6 +912,9 @@ main()
   validate_positive_integer STARTUP_TIMEOUT_SEC "$STARTUP_TIMEOUT_SEC"
   validate_positive_integer PROBE_TIMEOUT_SEC "$PROBE_TIMEOUT_SEC"
   validate_positive_integer SHUTDOWN_TIMEOUT_SEC "$SHUTDOWN_TIMEOUT_SEC"
+  [ -n "$D435_SERIAL" ] || stop "D435_SERIAL must not be empty"
+  [[ "$YOPO_DEPTH_TOPIC" = /* ]] ||
+    stop "YOPO_DEPTH_TOPIC must be absolute; got ${YOPO_DEPTH_TOPIC}"
   acquire_lock
   source_ros_environment
 
@@ -798,30 +939,52 @@ main()
   readonly LOG_DIR="${MOCAP_PRIMARY_LOG_DIR:-${WORKSPACE_ROOT}/log/mocap_primary_launcher/$(date -u +%Y%m%dT%H%M%SZ)}"
   mkdir -p "$LOG_DIR"
 
+  camera_index="${#child_pids[@]}"
+  start_launch d435_depth \
+    ros2 run realsense2_camera realsense2_camera_node --ros-args \
+    -r __node:=camera \
+    -r __ns:=/camera \
+    -r "/camera/depth/image_rect_raw:=${YOPO_DEPTH_TOPIC}" \
+    -p "serial_no:='${D435_SERIAL}'" \
+    -p enable_depth:=true \
+    -p enable_color:=false \
+    -p enable_infra1:=false \
+    -p enable_infra2:=false \
+    -p enable_gyro:=false \
+    -p enable_accel:=false \
+    -p unite_imu_method:=0 \
+    -p depth_module.emitter_enabled:=0 \
+    -p "depth_module.profile:='640x360x90'" \
+    -p publish_tf:=true
+  wait_for_depth_ready "$camera_index"
+
+  vrpn_index="${#child_pids[@]}"
   start_launch vrpn \
     ros2 launch vrpn_client_ros sample.launch.py
   wait_for_topic_message \
     "raw mocap pose" \
     /droneyee207/pose \
     geometry_msgs/msg/PoseStamped \
-    0
+    "$vrpn_index"
 
+  adapter_index="${#child_pids[@]}"
   start_launch mocap_adapter \
     ros2 launch mocap_localization_adapter mocap_adapter_shadow.launch.py
   wait_for_topic_message \
     "mocap source candidate" \
     /localization/candidates/mocap/base_pose \
     localization_adapter_interfaces/msg/LocalizationSourceCandidate \
-    1
+    "$adapter_index"
 
+  gateway_index="${#child_pids[@]}"
   start_launch selector_gateway \
     ros2 launch localization_output_gateway mocap_primary_output.launch.py
   wait_for_topic_message \
     "selected pose" \
     /localization/selected/pose \
     localization_adapter_interfaces/msg/SelectedPoseCandidate \
-    2
-  wait_for_gateway_healthy 2
+    "$gateway_index"
+  wait_for_gateway_healthy "$gateway_index"
   external_vision_active=1
   verify_external_vision_endpoint
   monitor_children
