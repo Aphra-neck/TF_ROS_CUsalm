@@ -11,6 +11,34 @@
 - Jetson 工作区已构建，容器内存在 `/workspaces/isaac_ros-dev/install/setup.bash`。
 - 启动期间保持飞机未解锁；先完成本文末尾的链路诊断。
 
+### 0.1 首次固化容器依赖（宿主机）
+
+运行中的容器里手动安装的软件包会随容器删除。首次部署或
+`docker/Dockerfile.yopo_mocap` 变更后，在飞机未解锁且旧容器任务均已停止时执行：
+
+```bash
+cd "$HOME/workspaces/isaac_ros_3_2/src/TF_ROS_CUsalm"
+bash tools/configure_isaac_ros_image.sh
+
+docker stop isaac_ros_dev-aarch64-container 2>/dev/null || true
+
+cd "$HOME/workspaces/isaac_ros_3_2/src/isaac_ros_common"
+unset SKIP_DOCKER_BUILD
+./scripts/run_dev.sh -d "$HOME/workspaces/isaac_ros_3_2"
+```
+
+这一次不能加 `-b`，因为必须生成含 `ros-humble-mavros-msgs` 的新镜像。进入新容器后验证：
+
+```bash
+source /opt/ros/humble/setup.bash
+ros2 pkg prefix mavros_msgs
+test -f /opt/ros/humble/lib/libmavros_msgs__rosidl_typesupport_cpp.so \
+  && echo "mavros_msgs_cpp_typesupport=PASS"
+```
+
+预期输出 `/opt/ros/humble`。镜像构建成功后退出容器，以后按第 1 节使用 `-b` 即可，
+无需再次手动 `apt install`。
+
 ## 1. 进入 Isaac ROS 容器（宿主机终端）
 
 每次需要新的容器终端时，在新的宿主机终端执行以下命令。已有容器运行时，脚本会连接到该容器。
