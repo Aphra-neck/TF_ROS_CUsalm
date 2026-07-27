@@ -217,12 +217,16 @@ SelectionResult SelectPose(const ModeFixture & fixture)
       publisher->publish(Candidate(*source, fixture));
     });
   EXPECT_TRUE(selected);
-  const std::size_t initial_output_count = outputs.size();
-  publisher->publish(Candidate(*source, fixture, 2.25, 3.75, 0.8, 0.9));
+  std::this_thread::sleep_for(1ms);
+  const auto followup = Candidate(*source, fixture, 2.25, 3.75, 0.8, 0.9);
+  const auto followup_stamp = followup.header.stamp;
+  publisher->publish(followup);
   const bool followup_selected = SpinUntil(
     executor,
-    [&outputs, initial_output_count]() {
-      return outputs.size() > initial_output_count;
+    [&outputs, followup_stamp]() {
+      return !outputs.empty() &&
+      outputs.back().header.stamp.sec == followup_stamp.sec &&
+      outputs.back().header.stamp.nanosec == followup_stamp.nanosec;
     },
     []() {});
   EXPECT_TRUE(followup_selected);

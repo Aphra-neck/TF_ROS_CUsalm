@@ -220,6 +220,15 @@ std::string DiagnosticValue(
   return "missing_key";
 }
 
+bool LastOutputMatches(
+  const std::vector<SelectedPoseCandidate> & outputs,
+  const LocalizationSourceCandidate & input)
+{
+  return !outputs.empty() &&
+         outputs.back().header.stamp.sec == input.header.stamp.sec &&
+         outputs.back().header.stamp.nanosec == input.header.stamp.nanosec;
+}
+
 TEST_F(SelectorAuthority, SelectedOutputGraphConvergesBeforeFirstValidation)
 {
   auto selector = std::make_shared<ScriptedSelector>(
@@ -326,6 +335,13 @@ TEST_F(SelectorAuthority, SelectedOutputUnknownIdentityAfterValidationLatches)
       [&source_publisher, &source]() {
         source_publisher->publish(Candidate(*source));
       }));
+  std::this_thread::sleep_for(1ms);
+  const auto barrier = Candidate(*source, 3.1);
+  source_publisher->publish(barrier);
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&outputs, &barrier]() {return LastOutputMatches(outputs, barrier);}));
   const std::size_t published_before_change = outputs.size();
 
   selector->SetSelectedEndpointIdentity(SelectedEndpointIdentity::kUnknown);
@@ -355,10 +371,12 @@ TEST_F(SelectorAuthority, SelectedOutputGidChangeAfterValidationLatches)
     rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile();
   auto source_publisher = source->create_publisher<LocalizationSourceCandidate>(
     "/localization/candidates/cuvslam/base_pose", qos);
-  std::size_t output_count = 0U;
+  std::vector<SelectedPoseCandidate> outputs;
   auto output_subscription = observer->create_subscription<SelectedPoseCandidate>(
     "/localization/selected/pose", qos,
-    [&output_count](const SelectedPoseCandidate::ConstSharedPtr) {++output_count;});
+    [&outputs](const SelectedPoseCandidate::ConstSharedPtr message) {
+      outputs.push_back(*message);
+    });
   std::optional<DiagnosticStatus> latest_status;
   auto diagnostic_subscription = ObserveSelectorDiagnostics(*observer, latest_status);
 
@@ -369,11 +387,18 @@ TEST_F(SelectorAuthority, SelectedOutputGidChangeAfterValidationLatches)
   ASSERT_TRUE(
     SpinUntilWithTick(
       executor,
-      [&output_count]() {return output_count > 0U;},
+      [&outputs]() {return !outputs.empty();},
       [&source_publisher, &source]() {
         source_publisher->publish(Candidate(*source));
       }));
-  const std::size_t published_before_change = output_count;
+  std::this_thread::sleep_for(1ms);
+  const auto barrier = Candidate(*source, 3.1);
+  source_publisher->publish(barrier);
+  ASSERT_TRUE(
+    SpinUntil(
+      executor,
+      [&outputs, &barrier]() {return LastOutputMatches(outputs, barrier);}));
+  const std::size_t published_before_change = outputs.size();
 
   selector->SetSelectedEndpointIdentity(SelectedEndpointIdentity::kMismatchedGid);
   ASSERT_TRUE(
@@ -387,7 +412,7 @@ TEST_F(SelectorAuthority, SelectedOutputGidChangeAfterValidationLatches)
   selector->SetSelectedEndpointIdentity(SelectedEndpointIdentity::kReported);
   source_publisher->publish(Candidate(*source));
   SpinFor(executor, 100ms);
-  EXPECT_EQ(output_count, published_before_change);
+  EXPECT_EQ(outputs.size(), published_before_change);
   (void)diagnostic_subscription;
   (void)output_subscription;
 }
