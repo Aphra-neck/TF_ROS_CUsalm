@@ -13,6 +13,9 @@ readonly WORKSPACE_SETUP_FILE="${WORKSPACE_SETUP_FILE:-/workspaces/isaac_ros-dev
 readonly WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspaces/isaac_ros-dev}"
 readonly STARTUP_TIMEOUT_SEC="${STARTUP_TIMEOUT_SEC:-30}"
 readonly PROBE_TIMEOUT_SEC="${PROBE_TIMEOUT_SEC:-3}"
+readonly DEPTH_RATE_PROBE_SEC="${DEPTH_RATE_PROBE_SEC:-3}"
+readonly MINIMUM_DEPTH_RATE_HZ="${MINIMUM_DEPTH_RATE_HZ:-80}"
+readonly MAXIMUM_DEPTH_RATE_HZ="${MAXIMUM_DEPTH_RATE_HZ:-100}"
 readonly SHUTDOWN_TIMEOUT_SEC="${SHUTDOWN_TIMEOUT_SEC:-8}"
 readonly LOCK_FILE="${MOCAP_PRIMARY_LOCK_FILE:-/tmp/yopo_mocap_primary_container.lock}"
 readonly D435_SERIAL="${D435_SERIAL-243622070369}"
@@ -29,6 +32,7 @@ pending_signal=""
 external_vision_active=0
 armed_stop_warning_issued=0
 last_gateway_published=""
+last_depth_rate_hz=""
 
 usage()
 {
@@ -435,6 +439,25 @@ camera_parameters_are_valid()
   [ "$value" = "String value is: 640x360x90" ]
 }
 
+depth_rate_is_valid()
+{
+  local output
+  local rate
+
+  output="$(timeout --signal=INT --kill-after=1s \
+    "${DEPTH_RATE_PROBE_SEC}s" ros2 topic hz "$YOPO_DEPTH_TOPIC" \
+    2>/dev/null || true)"
+  rate="$(printf '%s\n' "$output" |
+    awk '/^average rate:/ {rate = $3} END {print rate}')"
+  [[ "$rate" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+  awk \
+    -v rate="$rate" \
+    -v minimum="$MINIMUM_DEPTH_RATE_HZ" \
+    -v maximum="$MAXIMUM_DEPTH_RATE_HZ" \
+    'BEGIN {exit !(rate >= minimum && rate <= maximum)}' || return 1
+  last_depth_rate_hz="$rate"
+}
+
 wait_for_depth_ready()
 {
   local child_index="$1"
@@ -454,9 +477,11 @@ wait_for_depth_ready()
       endpoint_exists_in_info \
         "$endpoint" camera /camera sensor_msgs/msg/Image PUBLISHER &&
       depth_message_is_valid "$message" &&
-      camera_parameters_are_valid
+      camera_parameters_are_valid &&
+      depth_rate_is_valid
     then
-      log "D435 depth is ready (640x360, 16UC1, emitter disabled)"
+      log "D435 depth is ready (640x360, 16UC1, ${last_depth_rate_hz} Hz," \
+        "emitter disabled)"
       return
     fi
     sleep 1
@@ -765,6 +790,7 @@ runtime_health_check()
   depth_message="$(capture_one \
     "$YOPO_DEPTH_TOPIC" sensor_msgs/msg/Image)" || return 1
   depth_message_is_valid "$depth_message" || return 1
+  depth_rate_is_valid || return 1
 
   adapter_output="$(capture_diagnostic mocap_localization_adapter)" || return 1
   selector_output="$(capture_diagnostic localization_source_selector)" || return 1
@@ -911,6 +937,11 @@ main()
 
   validate_positive_integer STARTUP_TIMEOUT_SEC "$STARTUP_TIMEOUT_SEC"
   validate_positive_integer PROBE_TIMEOUT_SEC "$PROBE_TIMEOUT_SEC"
+  validate_positive_integer DEPTH_RATE_PROBE_SEC "$DEPTH_RATE_PROBE_SEC"
+  validate_positive_integer MINIMUM_DEPTH_RATE_HZ "$MINIMUM_DEPTH_RATE_HZ"
+  validate_positive_integer MAXIMUM_DEPTH_RATE_HZ "$MAXIMUM_DEPTH_RATE_HZ"
+  [ "$MINIMUM_DEPTH_RATE_HZ" -lt "$MAXIMUM_DEPTH_RATE_HZ" ] ||
+    stop "depth-rate range must be increasing"
   validate_positive_integer SHUTDOWN_TIMEOUT_SEC "$SHUTDOWN_TIMEOUT_SEC"
   [ -n "$D435_SERIAL" ] || stop "D435_SERIAL must not be empty"
   [[ "$YOPO_DEPTH_TOPIC" = /* ]] ||
